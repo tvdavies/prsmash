@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+#
+# prsmash — Review PRs in your queue in parallel, with optional selection.
+#
+# Usage:
+#   prsmash              # pick PRs via fzf, then review selected in parallel
+#   prsmash --all        # review every PR in the queue, no prompt
+#   prsmash --dry-run    # show what would be reviewed
+#
+set -eo pipefail
+
+QUEUE_SCRIPT="$HOME/.claude/skills/review-queue/scripts/review-queue.sh"
+
+# --- Colours ---
+BOLD='\033[1m'
+DIM='\033[2m'
+GREEN='\033[32m'
+RED='\033[31m'
+YELLOW='\033[33m'
+BLUE='\033[34m'
+RESET='\033[0m'
+
+# --- Args ---
+DRY_RUN=false
+SKIP_SELECT=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=true; shift ;;
+    --all|--no-select) SKIP_SELECT=true; shift ;;
+    *) echo "Unknown argument: $1" >&2; exit 1 ;;
+  esac
+done
+
+echo -e "${BOLD}prsmash${RESET} — automated PR review queue"
+echo ""
+
+# --- Fetch queue ---
+echo -e "${DIM}Fetching review queue...${RESET}"
+queue_json=$($QUEUE_SCRIPT)
+
+repo=$(echo "$queue_json" | jq -r '.repo')
+user=$(echo "$queue_json" | jq -r '.user')
+pr_count=$(echo "$queue_json" | jq '.prs | length')
+
+if [[ "$pr_count" -eq 0 ]]; then
+  echo "No PRs waiting for review."
+  exit 0
+fi
+
+echo -e "Found ${BOLD}${pr_count}${RESET} PRs in ${repo}"
+echo ""
+
+# --- Dry run ---
+if [[ "$DRY_RUN" == true ]]; then
+  echo -e "${YELLOW}Dry run — listing PRs without reviewing${RESET}"
+  echo ""
+  for i in $(seq 0 $((pr_count - 1))); do
+    pr_number=$(echo "$queue_json" | jq -r ".prs[$i].number")
+    pr_title=$(echo "$queue_json" | jq -r ".prs[$i].title")
+    pr_author=$(echo "$queue_json" | jq -r ".prs[$i].author.login")
+    echo -e "  #${pr_number} — ${pr_title} ${DIM}(${pr_author})${RESET}"
+  done
+  exit 0
+fi
+
+# --- Selection ---
+if [[ "$SKIP_SELECT" == false ]] && [[ "$pr_count" -gt 1 ]]; then
+  if ! command -v fzf >/dev/null 2>&1; then
+    echo "fzf is required for interactive selection. Install fzf or use --all." >&2
+    exit 1
+  fi
+
+  fzf_input=$(
+    for i in $(seq 0 $((pr_count - 1))); do
+      pr_number=$(echo "$queue_json" | jq -r ".prs[$i].number")
+      pr_title=$(echo "$queue_json" | jq -r ".prs[$i].title")
+      pr_author=$(echo "$queue_json" | jq -r ".prs[$i].author.login")
+      needs_rereview=$(echo "$queue_json" | jq -r ".prs[$i].needsRereview")
+      tag=""
+      [[ "$needs_rereview" == "true" ]] && tag=" [re-review]"
+      printf '%s\t#%s — %s (%s)%s\n' "$pr_number" "$pr_number" "$pr_title" "$pr_author" "$tag"
+    done
+  )
+
+  selected=$(printf '%s\n' "$fzf_input" | fzf \
+    --multi \
+    --delimiter=$'\t' \
+    --with-nth=2 \
+    --header=$'TAB: toggle  Ctrl-A: toggle-all  ENTER: review selected  ESC: cancel\nAll PRs pre-selected — press ENTER to review everything.' \
+    --bind 'start:select-all' \
+    --bind 'ctrl-a:toggle-all' \
+    --height=80% \
+    --reverse \
+    --prompt='PRs> ' || true)
+
+  if [[ -z "$selected" ]]; then
+    echo "No PRs selected. Exiting."
+    exit 0
+  fi
+
+  selected_numbers=$(echo "$selected" | cut -f1)
+  sel_array_json=$(echo "$selected_numbers" | jq -R -s -c 'split("\n") | map(select(length > 0) | tonumber)')
+  queue_json=$(echo "$queue_json" | jq --argjson sel "$sel_array_json" \
+    '.prs |= map(select(.number as $n | $sel | index($n) != null))')
+  pr_count=$(echo "$queue_json" | jq '.prs | length')
+
+  echo -e "Reviewing ${BOLD}${pr_count}${RESET} selected PRs"
+  echo ""
+fi
+
+# --- Parallel review ---
+MAX_RETRIES=2
+RETRY_DELAY=30
+
+reviewed=0
+approved=0
+changes_requested=0
+errored=0
+
+is_retryable() {
+  local log_file=$1
+  grep -qE 'API Error: 5[0-9]{2}|overloaded_error|api_error' "$log_file" 2>/dev/null
+}
+
+review_pr_bg() {
+  local pr_number=$1
+  local pr_repo=$2
+  local log_file=$3
+  local status_file=$4
+  local start end duration attempt=1 latest_state
+
+  start=$(date +%s)
+  while [[ $attempt -le $MAX_RETRIES ]]; do
+    if claude -p "/pr-review --headless --pr ${pr_number}" --permission-mode bypassPermissions > "$log_file" 2>&1; then
+      end=$(date +%s)
+      duration=$((end - start))
+      # GitHub's effective review state ignores COMMENTED reviews — only
+      # APPROVED/CHANGES_REQUESTED change state. Prefer the latest of those.
+      # Paginate: a single page (30) can miss recent reviews on busy PRs.
+      latest_state=$(gh api --paginate --slurp "repos/${pr_repo}/pulls/${pr_number}/reviews" 2>/dev/null \
+        | jq -r --arg me "$user" '
+            [.[] | .[]] as $all
+            | ([$all[] | select(.user.login == $me) | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED")] | last | .state)
+            // ([$all[] | select(.user.login == $me)] | last | .state)
+            // "UNKNOWN"
+          ' 2>/dev/null || echo "UNKNOWN")
+      printf 'OK|%s|%d\n' "$latest_state" "$duration" > "$status_file"
+      return 0
+    fi
+    if [[ $attempt -lt $MAX_RETRIES ]] && is_retryable "$log_file"; then
+      sleep "$RETRY_DELAY"
+      attempt=$((attempt + 1))
+      continue
+    fi
+    break
+  done
+  end=$(date +%s)
+  duration=$((end - start))
+  printf 'ERR||%d\n' "$duration" > "$status_file"
+  return 1
+}
+
+declare -A pid_info
+
+echo -e "${DIM}Launching ${pr_count} reviews in parallel...${RESET}"
+echo ""
+
+for i in $(seq 0 $((pr_count - 1))); do
+  pr_number=$(echo "$queue_json" | jq -r ".prs[$i].number")
+  pr_title=$(echo "$queue_json" | jq -r ".prs[$i].title")
+  pr_author=$(echo "$queue_json" | jq -r ".prs[$i].author.login")
+  needs_rereview=$(echo "$queue_json" | jq -r ".prs[$i].needsRereview")
+  pr_repo=$(echo "$queue_json" | jq -r ".prs[$i].repository.nameWithOwner")
+
+  log_file="/tmp/prsmash-${pr_number}.log"
+  status_file="/tmp/prsmash-${pr_number}.status"
+  rm -f "$status_file"
+
+  review_pr_bg "$pr_number" "$pr_repo" "$log_file" "$status_file" &
+  pid=$!
+  pid_info[$pid]="${pr_number}"$'\t'"${pr_title}"$'\t'"${pr_author}"$'\t'"${needs_rereview}"$'\t'"${log_file}"$'\t'"${status_file}"
+
+  tag=""
+  [[ "$needs_rereview" == "true" ]] && tag=" ${YELLOW}[re-review]${RESET}"
+  echo -e "  ${DIM}started${RESET} #${pr_number} — ${pr_title} ${DIM}(${pr_author})${RESET}${tag}"
+done
+
+echo ""
+echo -e "${DIM}Waiting for reviews to complete...${RESET}"
+echo ""
+
+completed=0
+total=$pr_count
+while [[ $completed -lt $total ]]; do
+  wait -n -p finished_pid || true
+  if [[ -z "${finished_pid:-}" ]] || [[ -z "${pid_info[$finished_pid]:-}" ]]; then
+    continue
+  fi
+
+  IFS=$'\t' read -r pr_number pr_title pr_author needs_rereview log_file status_file <<< "${pid_info[$finished_pid]}"
+  unset 'pid_info[$finished_pid]'
+  completed=$((completed + 1))
+
+  if [[ -f "$status_file" ]]; then
+    IFS='|' read -r result latest_state duration < "$status_file"
+  else
+    result=ERR
+    latest_state=""
+    duration=0
+  fi
+
+  mins=$((duration / 60))
+  secs=$((duration % 60))
+  time_str="${mins}m${secs}s"
+
+  prefix="${BOLD}[${completed}/${total}]${RESET} #${pr_number}"
+  suffix="${DIM}${pr_title} (${pr_author}) — ${time_str}${RESET}"
+
+  case "${result}:${latest_state}" in
+    OK:APPROVED)
+      echo -e "${prefix} ${GREEN}Approved${RESET} ${suffix}"
+      approved=$((approved + 1))
+      reviewed=$((reviewed + 1)) ;;
+    OK:CHANGES_REQUESTED)
+      echo -e "${prefix} ${RED}Changes requested${RESET} ${suffix}"
+      changes_requested=$((changes_requested + 1))
+      reviewed=$((reviewed + 1)) ;;
+    OK:*)
+      echo -e "${prefix} ${BLUE}Commented${RESET} ${suffix}"
+      reviewed=$((reviewed + 1)) ;;
+    *)
+      echo -e "${prefix} ${RED}Error${RESET} ${suffix} ${DIM}— see ${log_file}${RESET}"
+      errored=$((errored + 1)) ;;
+  esac
+done
+
+# --- Summary ---
+echo ""
+echo -e "${BOLD}Done${RESET} — ${reviewed} reviewed, ${errored} errored"
+echo -e "  ${GREEN}${approved} approved${RESET}  ${RED}${changes_requested} changes requested${RESET}"

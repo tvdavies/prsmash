@@ -1,0 +1,7 @@
+# Copy or symlink this file to ~/.config/review-queue/team
+# One GitHub login per line. Blank lines and `#` comments are ignored.
+# Used by skills/review-queue/scripts/review-stats.sh.
+
+alice
+bob
+carol
