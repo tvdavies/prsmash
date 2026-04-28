@@ -9,7 +9,17 @@
 #
 set -eo pipefail
 
-QUEUE_SCRIPT="$HOME/.claude/skills/review-queue/scripts/review-queue.sh"
+# Resolve QUEUE_SCRIPT relative to this script, following symlinks
+# (so `ln -s .../bin/prsmash ~/.local/bin/prsmash` still finds lib/).
+__src="${BASH_SOURCE[0]}"
+while [ -L "$__src" ]; do
+  __dir="$(cd -- "$(dirname -- "$__src")" && pwd)"
+  __src="$(readlink "$__src")"
+  [[ $__src != /* ]] && __src="$__dir/$__src"
+done
+__here="$(cd -- "$(dirname -- "$__src")" && pwd)"
+QUEUE_SCRIPT="${__here}/../lib/review-queue.sh"
+unset __src __dir __here
 
 # --- Colours ---
 BOLD='\033[1m'
