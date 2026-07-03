@@ -1,0 +1,13 @@
+[Unit]
+Description=Run prsmash on all queued PRs
+
+[Service]
+Type=oneshot
+# Set this to the repo prsmash reviews PRs for (or export PRSMASH_SOURCE_REPO).
+WorkingDirectory=%h/dev/lleverage-ai/lleverage
+# Make sure pi, gh, jq etc. are on PATH for the non-interactive unit.
+Environment=PATH=%h/.pi/agent/bin:%h/.local/bin:/usr/bin:/bin
+Environment=PRSMASH_LOG_DIR=%h/.prsmash
+ExecStart=/usr/bin/flock -n /tmp/prsmash-hourly.lock %h/.local/bin/prsmash --all
+StandardOutput=append:%h/.prsmash/hourly.log
+StandardError=append:%h/.prsmash/hourly.log

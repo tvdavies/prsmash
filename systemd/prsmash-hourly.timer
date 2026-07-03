@@ -1,0 +1,10 @@
+[Unit]
+Description=Run prsmash half-hourly
+
+[Timer]
+OnCalendar=*:0/30
+Persistent=true
+Unit=prsmash-hourly.service
+
+[Install]
+WantedBy=timers.target
