@@ -1,0 +1,13 @@
+[Unit]
+Description=Run prsmash on all queued Erys PRs
+ConditionPathIsDirectory=/home/tvd/dev/erys-ai/erys
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/tvd/dev/erys-ai/erys
+Environment=PATH=/home/tvd/.pi/agent/bin:/home/tvd/.local/bin:/home/tvd/.local/share/nvm/v24.15.0/bin:/usr/bin:/bin:/opt/google-cloud-cli/bin
+Environment=PRSMASH_SOURCE_REPO=/home/tvd/dev/erys-ai/erys
+Environment=PRSMASH_LOG_DIR=/home/tvd/.prsmash-erys
+ExecStart=/usr/bin/flock -n /tmp/prsmash-erys.lock /home/tvd/.local/bin/prsmash --all
+StandardOutput=append:/home/tvd/.prsmash-erys/scheduled.log
+StandardError=append:/home/tvd/.prsmash-erys/scheduled.log

@@ -141,12 +141,28 @@ systemctl --user daemon-reload
 systemctl --user enable --now prsmash-hourly.timer
 ```
 
+A second repository needs its own service/timer names, working directory, log
+root, and outer lock so its queue and run state cannot collide with the first.
+The included Erys units are staggered two minutes after the Lleverage schedule:
+
+```bash
+mkdir -p ~/.prsmash-erys ~/.config/systemd/user
+cp systemd/prsmash-erys.* ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now prsmash-erys.timer
+```
+
+The Erys repository's default `CODEOWNERS` rule requests review from Tom when a
+pull request becomes ready. Drafts and pull requests without a review request
+remain outside scheduled `--all` runs, matching the Lleverage queue semantics.
+
 ## Layout
 
 ```
 bin/prsmash                    the main script
 lib/review-queue.sh            builds the PR queue JSON (gh + jq)
-systemd/prsmash-hourly.*       half-hourly timer for prsmash --all
+systemd/prsmash-hourly.*       primary timer for prsmash --all
+systemd/prsmash-erys.*         staggered Erys timer with isolated logs and locks
 ```
 
 Each run writes to `$PRSMASH_LOG_DIR/runs/<run-id>/` (symlinked from

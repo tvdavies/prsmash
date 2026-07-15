@@ -1,0 +1,11 @@
+[Unit]
+Description=Run prsmash for Erys every 5 minutes
+
+[Timer]
+OnCalendar=*:2/5
+AccuracySec=1s
+Persistent=true
+Unit=prsmash-erys.service
+
+[Install]
+WantedBy=timers.target
