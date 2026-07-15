@@ -1,8 +1,8 @@
 [Unit]
-Description=Run prsmash half-hourly
+Description=Run prsmash every 5 minutes
 
 [Timer]
-OnCalendar=*:0/30
+OnCalendar=*:0/5
 Persistent=true
 Unit=prsmash-hourly.service
 

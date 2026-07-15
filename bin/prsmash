@@ -7,8 +7,7 @@
 #   prsmash --all        # review every PR in the queue, no prompt
 #   prsmash --dry-run    # show what would be reviewed
 #   prsmash --include-implicit  # include implicit re-review candidates in manual mode
-#   prsmash --approval-line-limit 1000  # only auto-approve PRs below this size
-#   prsmash --model anthropic-claude-code/claude-opus-4-7
+#   prsmash --model openai-codex/gpt-5.6-sol --thinking high
 #
 set -eo pipefail
 
@@ -16,8 +15,8 @@ QUEUE_SCRIPT="${PRSMASH_QUEUE_SCRIPT:-$HOME/.claude/skills/review-queue/scripts/
 PR_REVIEW_SKILL_DIR="${PR_REVIEW_SKILL_DIR:-$HOME/agent-skills/skills/pr-review}"
 PRSMASH_SOURCE_REPO="${PRSMASH_SOURCE_REPO:-$HOME/dev/lleverage-ai/lleverage}"
 SLACK_SCRIPT="${PRSMASH_SLACK_SCRIPT:-$HOME/.claude/skills/slack/scripts/slack.sh}"
-SLACK_MANUAL_APPROVAL_NOTIFY="${PRSMASH_SLACK_MANUAL_APPROVAL_NOTIFY:-true}"
-SLACK_MANUAL_APPROVAL_TARGET="${PRSMASH_SLACK_MANUAL_APPROVAL_TARGET:-@tom}"
+SLACK_APPROVAL_NOTIFY="${PRSMASH_SLACK_APPROVAL_NOTIFY:-true}"
+SLACK_APPROVAL_TARGET="${PRSMASH_SLACK_APPROVAL_TARGET:-@tom}"
 
 # --- Colours ---
 BOLD='\033[1m'
@@ -32,23 +31,19 @@ RESET='\033[0m'
 DRY_RUN=false
 SKIP_SELECT=false
 INCLUDE_IMPLICIT=false
-APPROVAL_LINE_LIMIT="${PRSMASH_APPROVAL_LINE_LIMIT:-1000}"
-MODEL="${PI_PRSMASH_MODEL:-anthropic-claude-code/claude-opus-4-7}"
+MODEL="${PI_PRSMASH_MODEL:-openai-codex/gpt-5.6-sol}"
+THINKING_LEVEL="${PI_PRSMASH_THINKING:-high}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=true; shift ;;
     --all|--no-select) SKIP_SELECT=true; shift ;;
     --include-implicit) INCLUDE_IMPLICIT=true; shift ;;
-    --approval-line-limit) APPROVAL_LINE_LIMIT="${2:-}"; [[ -n "$APPROVAL_LINE_LIMIT" ]] || { echo "--approval-line-limit requires a value" >&2; exit 1; }; shift 2 ;;
+    --approval-line-limit) [[ -n "${2:-}" ]] || { echo "--approval-line-limit requires a value" >&2; exit 1; }; echo "Warning: --approval-line-limit is ignored; prsmash now approves eligible PRs regardless of size." >&2; shift 2 ;;
     --model) MODEL="${2:-}"; [[ -n "$MODEL" ]] || { echo "--model requires a value" >&2; exit 1; }; shift 2 ;;
+    --thinking) THINKING_LEVEL="${2:-}"; [[ -n "$THINKING_LEVEL" ]] || { echo "--thinking requires a value" >&2; exit 1; }; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
-
-if ! [[ "$APPROVAL_LINE_LIMIT" =~ ^[0-9]+$ ]] || [[ "$APPROVAL_LINE_LIMIT" -le 0 ]]; then
-  echo "--approval-line-limit must be a positive integer" >&2
-  exit 1
-fi
 
 # --- Locks and logs ---
 LOG_ROOT="${PRSMASH_LOG_DIR:-$HOME/.prsmash}"
@@ -210,7 +205,9 @@ trap cleanup_run_resources EXIT
 echo -e "${BOLD}prsmash${RESET} — automated PR review queue"
 echo -e "${DIM}Run logs: ${RUN_DIR}${RESET}"
 echo -e "${DIM}Source repo: ${PRSMASH_SOURCE_REPO}${RESET}"
-echo -e "${DIM}Auto-approval limit: PRs must be < ${APPROVAL_LINE_LIMIT} changed lines${RESET}"
+echo -e "${DIM}Model: ${MODEL}${RESET}"
+echo -e "${DIM}Thinking: ${THINKING_LEVEL}${RESET}"
+echo -e "${DIM}Approval Slack DM target: ${SLACK_APPROVAL_TARGET}${RESET}"
 echo ""
 
 if ! git -C "$PRSMASH_SOURCE_REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -422,6 +419,7 @@ EOF
 run_pr_review() {
   local pr_number=$1
   local pr_repo=$2
+  local since_commit=$3
   local session_dir="$RUN_DIR/sessions/pr-${pr_number}"
   local worktree_dir="$RUN_DIR/worktrees/pr-${pr_number}"
   local tmp_dir="$RUN_DIR/tmp/pr-${pr_number}"
@@ -429,14 +427,32 @@ run_pr_review() {
 
   prepare_pr_context "$pr_number" "$pr_repo" "$worktree_dir" "$tmp_dir"
 
-  local args=(--session-dir "$session_dir" --skill "$PR_REVIEW_SKILL_DIR" -p "/skill:pr-review --headless --pr ${pr_number}")
+  # Incremental re-review: when we know the commit our last review looked at,
+  # narrow the review to what changed since. Only valid if that commit is an
+  # ancestor of the current head (a rebase/force-push invalidates it).
+  local skill_cmd="/skill:pr-review --headless --pr ${pr_number}"
+  if [[ -n "$since_commit" && "$since_commit" != "null" ]]; then
+    if git -C "$worktree_dir" cat-file -e "$since_commit" 2>/dev/null \
+       && git -C "$worktree_dir" merge-base --is-ancestor "$since_commit" HEAD 2>/dev/null \
+       && [[ "$since_commit" != "$(git -C "$worktree_dir" rev-parse HEAD)" ]]; then
+      skill_cmd="/skill:pr-review --headless --pr ${pr_number} --since ${since_commit}"
+      echo "incrementalReviewSince=${since_commit}"
+    else
+      echo "incrementalReviewSince=invalid (${since_commit} not an ancestor of head; running full review)"
+    fi
+  fi
+
+  local args=(--session-dir "$session_dir" --skill "$PR_REVIEW_SKILL_DIR" -p "$skill_cmd")
+  if [[ -n "$THINKING_LEVEL" ]]; then
+    args=(--thinking "$THINKING_LEVEL" "${args[@]}")
+  fi
   if [[ -n "$MODEL" ]]; then
     args=(--model "$MODEL" "${args[@]}")
   fi
   if command -v setsid >/dev/null 2>&1; then
-    (cd "$worktree_dir" && TMPDIR="$tmp_dir" PR_REVIEW_TMPDIR="$tmp_dir" PRSMASH_APPROVAL_LINE_LIMIT="$APPROVAL_LINE_LIMIT" setsid pi "${args[@]}")
+    (cd "$worktree_dir" && TMPDIR="$tmp_dir" PR_REVIEW_TMPDIR="$tmp_dir" PRSMASH_APPROVAL_LINE_LIMIT= PRSMASH_APPROVAL_MAX_LINES= setsid pi "${args[@]}")
   else
-    (cd "$worktree_dir" && TMPDIR="$tmp_dir" PR_REVIEW_TMPDIR="$tmp_dir" PRSMASH_APPROVAL_LINE_LIMIT="$APPROVAL_LINE_LIMIT" pi "${args[@]}")
+    (cd "$worktree_dir" && TMPDIR="$tmp_dir" PR_REVIEW_TMPDIR="$tmp_dir" PRSMASH_APPROVAL_LINE_LIMIT= PRSMASH_APPROVAL_MAX_LINES= pi "${args[@]}")
   fi
 }
 
@@ -468,44 +484,33 @@ log_field() {
   grep -m1 "^${name}=" "$log_file" 2>/dev/null | cut -d= -f2- || true
 }
 
-manual_approval_line_summary() {
+approval_line_summary() {
   local log_file=$1
-  local marker changed additions deletions base_oid head_oid worktree shortstat files
-
-  marker=$(grep -m1 -oE '<!-- manual-approval-required [^>]+-->' "$log_file" 2>/dev/null || true)
-  changed=$(sed -n 's/.*changed_lines=\([0-9][0-9]*\).*/\1/p' <<<"$marker")
-  additions=$(sed -n 's/.*additions=\([0-9][0-9]*\).*/\1/p' <<<"$marker")
-  deletions=$(sed -n 's/.*deletions=\([0-9][0-9]*\).*/\1/p' <<<"$marker")
-  if [[ -n "$changed" && -n "$additions" && -n "$deletions" ]]; then
-    printf '%s changed lines (+%s/-%s)' "$changed" "$additions" "$deletions"
-    return 0
-  fi
+  local changed additions deletions base_oid head_oid worktree shortstat files
 
   base_oid=$(log_field "$log_file" baseRefOid)
   head_oid=$(log_field "$log_file" headRefOid)
   worktree=$(log_field "$log_file" worktree)
   if [[ -n "$base_oid" && -n "$head_oid" && -n "$worktree" && -d "$worktree" ]]; then
-    shortstat=$(git -C "$worktree" diff --shortstat "${base_oid}..${head_oid}" 2>/dev/null || true)
+    shortstat=$(git -C "$worktree" diff --shortstat "${base_oid}...${head_oid}" 2>/dev/null || true)
     additions=$(grep -oE '[0-9]+ insertions?\(\+\)' <<<"$shortstat" | awk '{print $1}' || true)
     deletions=$(grep -oE '[0-9]+ deletions?\(-\)' <<<"$shortstat" | awk '{print $1}' || true)
     files=$(grep -oE '[0-9]+ files? changed' <<<"$shortstat" | awk '{print $1}' || true)
     additions=${additions:-0}
     deletions=${deletions:-0}
     changed=$((additions + deletions))
-    if [[ "$changed" -gt 0 ]]; then
-      if [[ -n "$files" ]]; then
-        printf '%s changed lines (+%s/-%s, %s files)' "$changed" "$additions" "$deletions" "$files"
-      else
-        printf '%s changed lines (+%s/-%s)' "$changed" "$additions" "$deletions"
-      fi
-      return 0
+    if [[ -n "$files" ]]; then
+      printf '%s changed lines (+%s/-%s, %s files)' "$changed" "$additions" "$deletions" "$files"
+    else
+      printf '%s changed lines (+%s/-%s)' "$changed" "$additions" "$deletions"
     fi
+    return 0
   fi
 
-  printf 'over %s changed lines' "$APPROVAL_LINE_LIMIT"
+  printf 'changed line count unavailable'
 }
 
-notify_manual_approval_slack() {
+notify_approval_slack() {
   local pr_number=$1
   local pr_repo=$2
   local pr_title=$3
@@ -513,46 +518,45 @@ notify_manual_approval_slack() {
   local log_file=$5
   local head_oid marker_dir marker_file safe_key line_summary pr_url target channel message
 
-  [[ "$SLACK_MANUAL_APPROVAL_NOTIFY" == "true" ]] || return 0
-  [[ -x "$SLACK_SCRIPT" ]] || { echo -e "${DIM}Slack manual-approval notification skipped: ${SLACK_SCRIPT} not executable${RESET}"; return 0; }
-  [[ -n "${SLACK_MCP_XOXC_TOKEN:-}" && -n "${SLACK_MCP_XOXD_TOKEN:-}" ]] || { echo -e "${DIM}Slack manual-approval notification skipped: Slack tokens not in environment${RESET}"; return 0; }
+  [[ "$SLACK_APPROVAL_NOTIFY" == "true" ]] || return 0
+  [[ -x "$SLACK_SCRIPT" ]] || { echo -e "${DIM}Slack approval notification skipped: ${SLACK_SCRIPT} not executable${RESET}"; return 0; }
+  [[ -n "${SLACK_MCP_XOXC_TOKEN:-}" && -n "${SLACK_MCP_XOXD_TOKEN:-}" ]] || { echo -e "${DIM}Slack approval notification skipped: Slack tokens not in environment${RESET}"; return 0; }
 
   head_oid=$(log_field "$log_file" headRefOid)
   safe_key=$(printf '%s-%s-%s' "$pr_repo" "$pr_number" "${head_oid:-unknown-head}" | tr '/:' '__')
-  marker_dir="$LOG_ROOT/manual-approval-notifications"
+  marker_dir="$LOG_ROOT/approval-notifications"
   marker_file="$marker_dir/${safe_key}.sent"
   if [[ -f "$marker_file" ]]; then
-    echo -e "${DIM}Slack manual-approval notification already sent for #${pr_number} at ${head_oid:-unknown head}${RESET}"
+    echo -e "${DIM}Slack approval notification already sent for #${pr_number} at ${head_oid:-unknown head}${RESET}"
     return 0
   fi
 
   mkdir -p "$marker_dir"
   pr_url="https://github.com/${pr_repo}/pull/${pr_number}"
-  line_summary=$(manual_approval_line_summary "$log_file")
-  message=$(printf 'PR approved but needs manual approval (%s >= %s line limit)\n#%s — %s\n%s\nAuthor: %s\nLog: %s' \
-    "$line_summary" \
-    "$APPROVAL_LINE_LIMIT" \
+  line_summary=$(approval_line_summary "$log_file")
+  message=$(printf 'PR approved by prsmash\n#%s — %s\n%s\nLines: %s\nAuthor: %s\nLog: %s' \
     "$pr_number" \
     "$pr_title" \
     "$pr_url" \
+    "$line_summary" \
     "$pr_author" \
     "$log_file")
 
-  if [[ -n "${PRSMASH_SLACK_MANUAL_APPROVAL_CHANNEL:-}" ]]; then
-    channel="$PRSMASH_SLACK_MANUAL_APPROVAL_CHANNEL"
+  if [[ -n "${PRSMASH_SLACK_APPROVAL_CHANNEL:-}" ]]; then
+    channel="$PRSMASH_SLACK_APPROVAL_CHANNEL"
   else
-    target="$SLACK_MANUAL_APPROVAL_TARGET"
+    target="$SLACK_APPROVAL_TARGET"
     if ! channel=$("$SLACK_SCRIPT" resolve "$target" 2>/dev/null); then
-      echo -e "${DIM}Slack manual-approval notification skipped: could not resolve ${target}${RESET}"
+      echo -e "${DIM}Slack approval notification skipped: could not resolve ${target}${RESET}"
       return 0
     fi
   fi
 
   if printf '%s\n' "$message" | "$SLACK_SCRIPT" send "$channel" - >/dev/null 2>&1; then
     date -Is > "$marker_file"
-    echo -e "${DIM}Slack manual-approval notification sent for #${pr_number}${RESET}"
+    echo -e "${DIM}Slack approval notification sent for #${pr_number}${RESET}"
   else
-    echo -e "${DIM}Slack manual-approval notification failed for #${pr_number}${RESET}"
+    echo -e "${DIM}Slack approval notification failed for #${pr_number}${RESET}"
   fi
 }
 
@@ -561,6 +565,7 @@ review_pr_bg() {
   local pr_repo=$2
   local log_file=$3
   local status_file=$4
+  local since_commit=$5
   local start end duration attempt=1 latest_state lock_name
 
   lock_name=$(printf '%s-%s' "$pr_repo" "$pr_number" | tr '/:' '__')
@@ -572,7 +577,7 @@ review_pr_bg() {
 
   start=$(date +%s)
   while [[ $attempt -le $MAX_RETRIES ]]; do
-    if run_pr_review "$pr_number" "$pr_repo" > "$log_file" 2>&1; then
+    if run_pr_review "$pr_number" "$pr_repo" "$since_commit" > "$log_file" 2>&1; then
       end=$(date +%s)
       duration=$((end - start))
       # GitHub's effective review state ignores COMMENTED reviews — only
@@ -616,20 +621,26 @@ for i in $(seq 0 $((pr_count - 1))); do
   pr_author=$(echo "$queue_json" | jq -r ".prs[$i].author.login")
   needs_rereview=$(echo "$queue_json" | jq -r ".prs[$i].needsRereview")
   implicit_rereview=$(echo "$queue_json" | jq -r ".prs[$i].implicitRereview")
+  queue_source=$(echo "$queue_json" | jq -r ".prs[$i].queueSource // \"review-request\"")
+  my_review_commit=$(echo "$queue_json" | jq -r ".prs[$i].myReviewCommit // empty")
   pr_repo=$(echo "$queue_json" | jq -r ".prs[$i].repository.nameWithOwner")
+
+  since_commit=""
+  [[ "$needs_rereview" == "true" ]] && since_commit="$my_review_commit"
 
   safe_repo=$(echo "$pr_repo" | tr '/:' '__')
   log_file="$RUN_DIR/pr-${pr_number}-${safe_repo}.log"
   status_file="$RUN_DIR/pr-${pr_number}.status"
   rm -f "$status_file"
 
-  review_pr_bg "$pr_number" "$pr_repo" "$log_file" "$status_file" &
+  review_pr_bg "$pr_number" "$pr_repo" "$log_file" "$status_file" "$since_commit" &
   pid=$!
   CHILD_PIDS+=("$pid")
   pid_info[$pid]="${pr_number}"$'\t'"${pr_title}"$'\t'"${pr_author}"$'\t'"${needs_rereview}"$'\t'"${log_file}"$'\t'"${status_file}"$'\t'"${pr_repo}"
 
   tag=""
   [[ "$needs_rereview" == "true" ]] && tag=" ${YELLOW}[re-review]${RESET}"
+  [[ "$queue_source" == "threads-resolved" ]] && tag=" ${YELLOW}[re-review: threads resolved]${RESET}"
   [[ "$implicit_rereview" == "true" ]] && tag=" ${BLUE}[implicit re-review]${RESET}"
   echo -e "  ${DIM}started${RESET} #${pr_number} — ${pr_title} ${DIM}(${pr_author})${RESET}${tag}"
 done
@@ -669,11 +680,11 @@ while [[ $completed -lt $total ]]; do
   case "${result}:${latest_state}" in
     OK:APPROVED)
       echo -e "${prefix} ${GREEN}Approved${RESET} ${suffix}"
+      notify_approval_slack "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$log_file" || true
       approved=$((approved + 1))
       reviewed=$((reviewed + 1)) ;;
     OK:MANUAL_APPROVAL_REQUIRED)
-      echo -e "${prefix} ${YELLOW}Manual approval needed${RESET} ${suffix}"
-      notify_manual_approval_slack "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$log_file" || true
+      echo -e "${prefix} ${YELLOW}Manual approval needed${RESET} ${suffix} ${DIM}— unexpected; prsmash no longer sets an approval line limit${RESET}"
       manual_approval=$((manual_approval + 1))
       reviewed=$((reviewed + 1)) ;;
     OK:CHANGES_REQUESTED)
@@ -697,7 +708,7 @@ cat > "$RUN_DIR/summary.txt" <<EOF
 reviewed=$reviewed
 errored=$errored
 approved=$approved
-manual_approval=$manual_approval
+manual_approval_unexpected=$manual_approval
 changes_requested=$changes_requested
 EOF
 
@@ -705,5 +716,8 @@ cleanup_run_resources
 
 echo ""
 echo -e "${BOLD}Done${RESET} — ${reviewed} reviewed, ${errored} errored"
-echo -e "  ${GREEN}${approved} approved${RESET}  ${YELLOW}${manual_approval} need manual approval${RESET}  ${RED}${changes_requested} changes requested${RESET}"
+echo -e "  ${GREEN}${approved} approved${RESET}  ${RED}${changes_requested} changes requested${RESET}"
+if [[ "$manual_approval" -gt 0 ]]; then
+  echo -e "  ${YELLOW}${manual_approval} unexpected manual-approval downgrades${RESET}"
+fi
 echo -e "  ${DIM}logs: ${RUN_DIR}${RESET}"
