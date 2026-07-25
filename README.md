@@ -95,7 +95,7 @@ Then point it at your setup (env vars, with these defaults):
 | `PRSMASH_SOURCE_REPO` | `~/dev/lleverage-ai/lleverage` | Local clone of the repo whose PRs you review |
 | `PR_REVIEW_SKILL_DIR` | `~/agent-skills/skills/pr-review` | The pi `pr-review` skill directory |
 | `PRSMASH_QUEUE_SCRIPT` | `~/.claude/skills/review-queue/scripts/review-queue.sh` | Queue script (a copy lives in `lib/review-queue.sh`) |
-| `PI_PRSMASH_MODEL` | `anthropic-claude-code/claude-opus-4-7` | Model passed to `pi --model` |
+| `PI_PRSMASH_MODEL` | `anthropic-claude-code/claude-opus-5` | Model passed to `pi --model` |
 | `PRSMASH_APPROVAL_LINE_LIMIT` | `1000` | Auto-approval size threshold |
 | `PRSMASH_LOG_DIR` | `~/.prsmash` | Locks, run logs, notification markers |
 | `PRSMASH_SLACK_SCRIPT` | `~/.claude/skills/slack/scripts/slack.sh` | Slack send helper |

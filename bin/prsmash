@@ -7,7 +7,7 @@
 #   prsmash --all        # review every PR in the queue, no prompt
 #   prsmash --dry-run    # show what would be reviewed
 #   prsmash --include-implicit  # include implicit re-review candidates in manual mode
-#   prsmash --model openai-codex/gpt-5.6-sol --thinking high
+#   prsmash --model anthropic-claude-code/claude-opus-5 --thinking high
 #
 set -eo pipefail
 
@@ -31,7 +31,7 @@ RESET='\033[0m'
 DRY_RUN=false
 SKIP_SELECT=false
 INCLUDE_IMPLICIT=false
-MODEL="${PI_PRSMASH_MODEL:-openai-codex/gpt-5.6-sol}"
+MODEL="${PI_PRSMASH_MODEL:-anthropic-claude-code/claude-opus-5}"
 THINKING_LEVEL="${PI_PRSMASH_THINKING:-high}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
