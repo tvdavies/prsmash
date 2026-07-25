@@ -85,7 +85,7 @@ skill signals back by printing `PRSMASH_MANUAL_APPROVAL_REQUIRED=true`.
 ```bash
 git clone https://github.com/tvdavies/prsmash.git ~/src/prsmash
 mkdir -p ~/.local/bin
-cp ~/src/prsmash/bin/prsmash ~/.local/bin/prsmash
+ln -sf ~/src/prsmash/bin/prsmash ~/.local/bin/prsmash
 ```
 
 Then point it at your setup (env vars, with these defaults):

@@ -224,6 +224,18 @@ fi
 queue_json=$($QUEUE_SCRIPT "${queue_args[@]}")
 printf '%s\n' "$queue_json" > "$RUN_DIR/queue.json"
 
+# Some queue-script versions return a human-readable message before the current
+# user has any review history in a repository. Treat that as an empty queue,
+# while still failing closed for any other malformed response.
+if ! jq -e 'type == "object" and (.prs | type == "array")' >/dev/null 2>&1 <<<"$queue_json"; then
+  if [[ "$queue_json" == No\ PRs* ]]; then
+    printf '%s\n' "$queue_json"
+    exit 0
+  fi
+  echo "Queue script returned an invalid response; see $RUN_DIR/queue.json" >&2
+  exit 1
+fi
+
 repo=$(echo "$queue_json" | jq -r '.repo')
 user=$(echo "$queue_json" | jq -r '.user')
 
