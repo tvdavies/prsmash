@@ -17,6 +17,12 @@ PRSMASH_SOURCE_REPO="${PRSMASH_SOURCE_REPO:-$HOME/dev/lleverage-ai/lleverage}"
 SLACK_SCRIPT="${PRSMASH_SLACK_SCRIPT:-$HOME/.claude/skills/slack/scripts/slack.sh}"
 SLACK_APPROVAL_NOTIFY="${PRSMASH_SLACK_APPROVAL_NOTIFY:-true}"
 SLACK_APPROVAL_TARGET="${PRSMASH_SLACK_APPROVAL_TARGET:-@tom}"
+# Hard cap on a single review. A review agent can spawn a child that never exits
+# (e.g. importing react-dom/server.browser.js under node keeps the event loop
+# alive forever), which otherwise wedges the run, the systemd unit, and every
+# subsequent timer firing. p99 review duration is ~32m, so 45m only cuts runs
+# that are already pathological.
+REVIEW_TIMEOUT="${PRSMASH_REVIEW_TIMEOUT:-2700}"
 
 # --- Colours ---
 BOLD='\033[1m'
@@ -461,11 +467,19 @@ run_pr_review() {
   if [[ -n "$MODEL" ]]; then
     args=(--model "$MODEL" "${args[@]}")
   fi
+  # Keep the timeout inside setsid: `setsid pi` may fork rather than exec, which
+  # would let an outer timeout return before pi has finished.
+  local runner=(timeout --kill-after=60 "$REVIEW_TIMEOUT" pi "${args[@]}")
   if command -v setsid >/dev/null 2>&1; then
-    (cd "$worktree_dir" && TMPDIR="$tmp_dir" PR_REVIEW_TMPDIR="$tmp_dir" PRSMASH_APPROVAL_LINE_LIMIT= PRSMASH_APPROVAL_MAX_LINES= setsid pi "${args[@]}")
-  else
-    (cd "$worktree_dir" && TMPDIR="$tmp_dir" PR_REVIEW_TMPDIR="$tmp_dir" PRSMASH_APPROVAL_LINE_LIMIT= PRSMASH_APPROVAL_MAX_LINES= pi "${args[@]}")
+    runner=(setsid "${runner[@]}")
   fi
+
+  local rc=0
+  (cd "$worktree_dir" && TMPDIR="$tmp_dir" PR_REVIEW_TMPDIR="$tmp_dir" PRSMASH_APPROVAL_LINE_LIMIT= PRSMASH_APPROVAL_MAX_LINES= "${runner[@]}") || rc=$?
+  if [[ $rc -eq 124 || $rc -eq 137 ]]; then
+    echo "PRSMASH_REVIEW_TIMEOUT: killed after ${REVIEW_TIMEOUT}s"
+  fi
+  return $rc
 }
 
 append_latest_review_body() {

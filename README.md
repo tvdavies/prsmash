@@ -97,6 +97,7 @@ Then point it at your setup (env vars, with these defaults):
 | `PRSMASH_QUEUE_SCRIPT` | `~/.claude/skills/review-queue/scripts/review-queue.sh` | Queue script (a copy lives in `lib/review-queue.sh`) |
 | `PI_PRSMASH_MODEL` | `anthropic-claude-code/claude-opus-5` | Model passed to `pi --model` |
 | `PRSMASH_APPROVAL_LINE_LIMIT` | `1000` | Auto-approval size threshold |
+| `PRSMASH_REVIEW_TIMEOUT` | `2700` | Seconds before a single review is killed (p99 is ~32m) |
 | `PRSMASH_LOG_DIR` | `~/.prsmash` | Locks, run logs, notification markers |
 | `PRSMASH_SLACK_SCRIPT` | `~/.claude/skills/slack/scripts/slack.sh` | Slack send helper |
 | `PRSMASH_SLACK_MANUAL_APPROVAL_NOTIFY` | `true` | Toggle Slack notifications |

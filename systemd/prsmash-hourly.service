@@ -3,6 +3,11 @@ Description=Run prsmash on all queued PRs
 
 [Service]
 Type=oneshot
+# Type=oneshot defaults to TimeoutStartSec=infinity, so a single hung review
+# leaves the unit in "activating" forever and the timer never fires again.
+# Backstop above the per-review cap in prsmash itself.
+TimeoutStartSec=3600
+TimeoutStopSec=120
 WorkingDirectory=/home/tvd/dev/lleverage-ai/lleverage
 Environment=PATH=/home/tvd/.pi/agent/bin:/home/tvd/.local/bin:/home/tvd/.local/share/nvm/v24.15.0/bin:/usr/bin:/bin:/opt/google-cloud-cli/bin
 Environment=PRSMASH_LOG_DIR=/home/tvd/.prsmash
