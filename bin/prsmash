@@ -354,6 +354,10 @@ approved=0
 manual_approval=0
 changes_requested=0
 errored=0
+# A PR already being reviewed by an overlapping run is a routine outcome now
+# that scheduled runs overlap, not a failure. Counting it separately keeps
+# errored meaning "something actually went wrong".
+skipped=0
 
 is_retryable() {
   local log_file=$1
@@ -728,7 +732,7 @@ while [[ $completed -lt $total ]]; do
       reviewed=$((reviewed + 1)) ;;
     LOCKED:*)
       echo -e "${prefix} ${YELLOW}Skipped${RESET} ${suffix} ${DIM}— already being reviewed${RESET}"
-      errored=$((errored + 1)) ;;
+      skipped=$((skipped + 1)) ;;
     *)
       echo -e "${prefix} ${RED}Error${RESET} ${suffix} ${DIM}— see ${log_file}${RESET}"
       errored=$((errored + 1)) ;;
@@ -739,6 +743,7 @@ done
 cat > "$RUN_DIR/summary.txt" <<EOF
 reviewed=$reviewed
 errored=$errored
+skipped=$skipped
 approved=$approved
 manual_approval_unexpected=$manual_approval
 changes_requested=$changes_requested
@@ -749,6 +754,9 @@ cleanup_run_resources
 echo ""
 echo -e "${BOLD}Done${RESET} — ${reviewed} reviewed, ${errored} errored"
 echo -e "  ${GREEN}${approved} approved${RESET}  ${RED}${changes_requested} changes requested${RESET}"
+if [[ "$skipped" -gt 0 ]]; then
+  echo -e "  ${YELLOW}${skipped} skipped${RESET} ${DIM}— already being reviewed by another run${RESET}"
+fi
 if [[ "$manual_approval" -gt 0 ]]; then
   echo -e "  ${YELLOW}${manual_approval} unexpected manual-approval downgrades${RESET}"
 fi
