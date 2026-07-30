@@ -55,10 +55,16 @@ done
 LOG_ROOT="${PRSMASH_LOG_DIR:-$HOME/.prsmash}"
 mkdir -p "$LOG_ROOT/locks"
 
-exec 9>"$LOG_ROOT/locks/prsmash.lock"
-if ! flock -n 9; then
-  echo "Another prsmash instance is already running. Exiting." >&2
-  exit 1
+# The whole-process lock keeps two interactive runs from fighting over the same
+# queue. Scheduled runs opt out: per-PR flocks (see review_pr) already make
+# concurrent runs safe, and holding this lock means one slow review suppresses
+# every subsequent tick rather than just the PRs it is working on.
+if [[ "${PRSMASH_ALLOW_CONCURRENT:-0}" != "1" ]]; then
+  exec 9>"$LOG_ROOT/locks/prsmash.lock"
+  if ! flock -n 9; then
+    echo "Another prsmash instance is already running. Exiting." >&2
+    exit 1
+  fi
 fi
 
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"

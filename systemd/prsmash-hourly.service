@@ -1,16 +1,48 @@
 [Unit]
-Description=Run prsmash on all queued PRs
+Description=Dispatch a prsmash run over all queued PRs
 
 [Service]
+# The dispatcher only launches a transient unit and exits, so it completes in
+# milliseconds and a long review can never swallow the next timer tick. The old
+# shape (flock + one long-lived oneshot) meant a 45 minute run suppressed eight
+# consecutive ticks; prsmash's per-PR flocks already make overlapping runs safe,
+# so work is now serialised per PR rather than per run.
 Type=oneshot
-# Type=oneshot defaults to TimeoutStartSec=infinity, so a single hung review
-# leaves the unit in "activating" forever and the timer never fires again.
-# Backstop above the per-review cap in prsmash itself.
-TimeoutStartSec=3600
-TimeoutStopSec=120
-WorkingDirectory=/home/tvd/dev/lleverage-ai/lleverage
-Environment=PATH=/home/tvd/.pi/agent/bin:/home/tvd/.local/bin:/home/tvd/.local/share/nvm/v24.15.0/bin:/usr/bin:/bin:/opt/google-cloud-cli/bin
+TimeoutStartSec=60
+
+# Overlapping runs are cheap when there is nothing new (a run finds the in-flight
+# PRs locked and skips them in microseconds), but each still enumerates PRs
+# through gh, and any run that picks up new work stays alive for the length of
+# that review. Cap the number in flight so API load, worktree disk and agent
+# spend stay bounded.
+Environment=PRSMASH_MAX_CONCURRENT_RUNS=4
 Environment=PRSMASH_LOG_DIR=/home/tvd/.prsmash
-ExecStart=/usr/bin/flock -n /tmp/prsmash-hourly.lock /home/tvd/.local/bin/prsmash --all
+Environment=PATH=/home/tvd/.pi/agent/bin:/home/tvd/.local/bin:/home/tvd/.local/share/nvm/v24.15.0/bin:/usr/bin:/bin:/opt/google-cloud-cli/bin
+
+# $$ escapes a literal $ for the shell: systemd expands ${VAR} itself and does
+# not understand :- defaults, so every shell variable and substitution below has
+# to survive systemd's own pass. %% likewise yields a literal % for date(1).
+ExecStart=/bin/sh -c ' \
+  max="$${PRSMASH_MAX_CONCURRENT_RUNS:-4}"; \
+  running=$$(systemctl --user list-units --state=running --plain --no-legend "prsmash-run-*.service" 2>/dev/null | wc -l); \
+  if [ "$$running" -ge "$$max" ]; then \
+    echo "$$(date -Is) prsmash: $$running run(s) already active (max $$max), skipping tick"; \
+    exit 0; \
+  fi; \
+  unit="prsmash-run-$$(date +%%Y%%m%%d-%%H%%M%%S)"; \
+  echo "$$(date -Is) prsmash: dispatching $$unit ($$running active)"; \
+  exec systemd-run --user --collect --quiet \
+    --unit="$$unit" \
+    --description="prsmash review run" \
+    --working-directory=/home/tvd/dev/lleverage-ai/lleverage \
+    --setenv=PATH="$$PATH" \
+    --setenv=PRSMASH_LOG_DIR="$$PRSMASH_LOG_DIR" \
+    --setenv=PRSMASH_ALLOW_CONCURRENT=1 \
+    --property=RuntimeMaxSec=3600 \
+    /home/tvd/.local/bin/prsmash --all'
+
+# Dispatch decisions stay in hourly.log (one line per tick, so no interleaving).
+# Review output goes to each run's own directory and the transient unit's
+# journal, which is what made the shared append log unreadable before.
 StandardOutput=append:/home/tvd/.prsmash/hourly.log
 StandardError=append:/home/tvd/.prsmash/hourly.log
