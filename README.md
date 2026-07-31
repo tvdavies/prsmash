@@ -6,14 +6,14 @@ Review your GitHub PR queue in parallel with [pi](https://github.com/earendil-wo
 which ones to handle with `fzf` (or reviews everything with `--all`),
 and runs a `/pr-review` skill against each in parallel — each review in
 its own isolated, verified git worktree — reporting approved /
-needs-manual-approval / changes-requested as they finish.
+awaiting-your-approval / changes-requested as they finish.
 
 ```text
 prsmash — automated PR review queue
 
 Run logs: ~/.prsmash/runs/20260703-103000-2066728
 Source repo: ~/dev/acme/web
-Auto-approval limit: PRs must be < 1000 changed lines
+Auto-approve authors: bob,dave
 
 Fetching review queue...
 Found 4 PRs in acme/web
@@ -23,13 +23,14 @@ Launching 4 reviews in parallel...
   started #4830 — Bump deps (bob)
   ...
 
-[1/4] #4830 Approved              Bump deps (bob) — 1m12s
-[2/4] #4821 Changes requested     Fix flaky auth test (alice) — 2m04s
-[3/4] #4835 Manual approval needed  Rework billing engine (carol) — 4m31s
+[1/4] #4830 Approved                          Bump deps (bob) — 1m12s
+[2/4] #4821 Changes requested                 Fix flaky auth test (alice) — 2m04s
+[3/4] #4835 Review posted, awaiting your approval  Rework billing engine (carol) — 4m31s
 ...
 
 Done — 4 reviewed, 0 errored
-  2 approved  1 need manual approval  1 changes requested
+  2 approved  1 changes requested
+  1 awaiting your approval — review posted, approval left to you
   logs: ~/.prsmash/runs/20260703-103000-2066728
 ```
 
@@ -59,17 +60,75 @@ Reviews are guarded by locks: one global lock per machine (concurrent
 runs exit early) and one lock per PR (a PR already being reviewed by
 another run is skipped, not double-reviewed).
 
-## Auto-approval line limit
+## Trusted authors
 
-Large PRs shouldn't be rubber-stamped by an agent. If a PR that would
-be approved has **≥ `--approval-line-limit` changed lines** (default
-1000), the review is still posted but the run reports **"Manual
-approval needed"** instead of approving, and (optionally) sends you a
-Slack DM with the PR link and size — deduplicated per head SHA, so you
-are only pinged once per pushed state.
+Not every PR should be rubber-stamped by an agent, so approval is
+gated on who wrote the PR. `PRSMASH_TRUSTED_AUTHORS` (default
+`jaythegeek,corixdean,gsasu,beddial`) is a comma or space separated
+list of GitHub logins, matched case-insensitively:
 
-The limit is passed to the skill as `PRSMASH_APPROVAL_LINE_LIMIT`; the
-skill signals back by printing `PRSMASH_MANUAL_APPROVAL_REQUIRED=true`.
+- **On the list** — the review is submitted as a real GitHub
+  **approval**, exactly as before.
+- **Not on the list** — the identical review is posted as a
+  **comment**, carrying its `Approved` verdict plus a banner
+  explaining that a human makes the approval call. The run reports
+  **"Review posted, awaiting your approval"** and sends you a Slack DM
+  with the PR link.
+
+Set the list to an empty string to turn the gate off and approve every
+eligible PR.
+
+Only the approval is gated. `REQUEST_CHANGES` and plain comment
+reviews are posted normally whoever the author is, and the gate never
+turns a pass into a fail — an ungated PR gets the same verdict, just
+without the green tick.
+
+Slack DMs are deduplicated per PR head SHA, so you are pinged once per
+pushed state, not once per run.
+
+## Approving from Slack
+
+React to that DM and the next run applies your decision — 👍 approves
+the PR, 👎 drops it. There is no separate poller: every run checks
+pending approvals before it does anything else, including runs that
+find an empty queue, so a reaction is picked up within a tick.
+
+```text
+Checking 2 pending approval(s) for Slack reactions...
+  Approved #5973 on your Slack reaction
+  #5981 left unapproved on your reaction
+```
+
+Each decision is applied exactly once. A pending approval is a JSON
+record in `pending-approvals/`; acting on it moves the record to
+`processed-approvals/` with its outcome, so the same reaction is never
+replayed. Three further guards sit behind that:
+
+- A dedicated lock, so overlapping runs never race the same record.
+- The approval is refused if the PR head has moved since the review —
+  approving would be signing off code nobody read. prsmash reviews the
+  new head and asks again.
+- Before approving, it checks GitHub for an existing approval from you
+  at that exact commit, so even a crash mid-flight cannot double-approve.
+
+Anything that fails transiently (GitHub unreachable, Slack unreadable)
+is left pending and retried on the next run rather than dropped.
+
+Only reactions from the Slack account the tokens belong to count;
+`PRSMASH_SLACK_APPROVAL_USER` overrides whose reaction is trusted,
+which matters if you point the DMs at a shared channel. A 👎 alongside
+a 👍 is treated as a 👎, so changing your mind fails safe. Unanswered
+approvals are dropped after `PRSMASH_APPROVAL_PENDING_TTL_DAYS`
+(default 14).
+
+The list is passed to the skill as `PRSMASH_TRUSTED_AUTHORS`; the
+skill signals a downgrade back by printing
+`PRSMASH_MANUAL_APPROVAL_REQUIRED=true` and
+`PRSMASH_MANUAL_APPROVAL_REASON_CODE=untrusted-author`.
+
+`PRSMASH_APPROVAL_LINE_LIMIT` is a second, independent downgrade rule
+supported by the skill (reason code `approval-line-limit`). `prsmash`
+deliberately leaves it unset, so size alone never blocks an approval.
 
 ## Prerequisites
 
@@ -77,8 +136,11 @@ skill signals back by printing `PRSMASH_MANUAL_APPROVAL_REQUIRED=true`.
 - [`gh` CLI](https://cli.github.com/) authenticated (`gh auth status`)
 - [pi](https://github.com/earendil-works/pi-coding-agent) on PATH
 - A `pr-review` skill that accepts `--headless --pr <N>`
-- Optional, for Slack notifications: a `slack.sh` helper script plus
-  `SLACK_MCP_XOXC_TOKEN` / `SLACK_MCP_XOXD_TOKEN` in the environment
+- Optional, for Slack notifications and reaction approvals: a `slack.sh`
+  helper supporting `resolve`, `send`, `profile` and `reactions`, plus
+  `SLACK_MCP_XOXC_TOKEN` / `SLACK_MCP_XOXD_TOKEN` in the environment.
+  Without it, reviews for untrusted authors are still posted as
+  comments — you just have to approve them on GitHub yourself.
 
 ## Install
 
@@ -96,13 +158,17 @@ Then point it at your setup (env vars, with these defaults):
 | `PR_REVIEW_SKILL_DIR` | `~/agent-skills/skills/pr-review` | The pi `pr-review` skill directory |
 | `PRSMASH_QUEUE_SCRIPT` | `~/.claude/skills/review-queue/scripts/review-queue.sh` | Queue script (a copy lives in `lib/review-queue.sh`) |
 | `PI_PRSMASH_MODEL` | `anthropic-claude-code/claude-opus-5` | Model passed to `pi --model` |
-| `PRSMASH_APPROVAL_LINE_LIMIT` | `1000` | Auto-approval size threshold |
+| `PRSMASH_TRUSTED_AUTHORS` | `jaythegeek,corixdean,gsasu,beddial` | Authors whose PRs may be approved automatically (empty disables the gate) |
 | `PRSMASH_REVIEW_TIMEOUT` | `2700` | Seconds before a single review is killed (p99 is ~32m) |
 | `PRSMASH_LOG_DIR` | `~/.prsmash` | Locks, run logs, notification markers |
 | `PRSMASH_SLACK_SCRIPT` | `~/.claude/skills/slack/scripts/slack.sh` | Slack send helper |
-| `PRSMASH_SLACK_MANUAL_APPROVAL_NOTIFY` | `true` | Toggle Slack notifications |
-| `PRSMASH_SLACK_MANUAL_APPROVAL_TARGET` | `@tom` | DM target (resolved via the helper) |
-| `PRSMASH_SLACK_MANUAL_APPROVAL_CHANNEL` | _(unset)_ | Explicit channel ID, skips target resolution |
+| `PRSMASH_SLACK_APPROVAL_NOTIFY` | `true` | Toggle Slack notifications |
+| `PRSMASH_SLACK_APPROVAL_TARGET` | `@tom` | DM target (resolved via the helper) |
+| `PRSMASH_SLACK_APPROVAL_CHANNEL` | _(unset)_ | Explicit channel ID, skips target resolution |
+| `PRSMASH_SLACK_APPROVAL_USER` | _(the token's own user)_ | Whose reaction is allowed to approve |
+| `PRSMASH_APPROVE_REACTIONS` | `+1,thumbsup,white_check_mark,heavy_check_mark` | Reactions that approve (first is the one the DM suggests) |
+| `PRSMASH_REJECT_REACTIONS` | `-1,thumbsdown,x,no_entry_sign` | Reactions that drop the approval |
+| `PRSMASH_APPROVAL_PENDING_TTL_DAYS` | `14` | Days before an unanswered approval is dropped |
 
 Confirm with:
 
@@ -117,7 +183,8 @@ prsmash                          # pick PRs via fzf, review selected in parallel
 prsmash --all                    # review everything in the queue, no prompt
 prsmash --dry-run                # list what would be reviewed and exit
 prsmash --include-implicit      # also surface implicit re-review candidates (manual mode)
-prsmash --approval-line-limit 500  # tighten the auto-approval threshold
+prsmash --trusted-authors alice,bob  # override who may be approved automatically
+prsmash --trusted-authors ''         # approve every eligible PR (no author gate)
 prsmash --model <provider/model>   # override the pi model
 ```
 

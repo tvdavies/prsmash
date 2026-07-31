@@ -8,6 +8,11 @@
 #   prsmash --dry-run    # show what would be reviewed
 #   prsmash --include-implicit  # include implicit re-review candidates in manual mode
 #   prsmash --model anthropic-claude-code/claude-opus-5 --thinking high
+#   prsmash --trusted-authors alice,bob   # only auto-approve these authors ('' disables gating)
+#
+# PRs by authors outside the trusted list get their review posted as a comment
+# plus a Slack DM. Reacting to that DM approves (or drops) the PR on the next
+# run — see "Approving from Slack" in the README.
 #
 set -eo pipefail
 
@@ -17,6 +22,19 @@ PRSMASH_SOURCE_REPO="${PRSMASH_SOURCE_REPO:-$HOME/dev/lleverage-ai/lleverage}"
 SLACK_SCRIPT="${PRSMASH_SLACK_SCRIPT:-$HOME/.claude/skills/slack/scripts/slack.sh}"
 SLACK_APPROVAL_NOTIFY="${PRSMASH_SLACK_APPROVAL_NOTIFY:-true}"
 SLACK_APPROVAL_TARGET="${PRSMASH_SLACK_APPROVAL_TARGET:-@tom}"
+# Authors whose PRs we are happy to have approved without a human looking. Every
+# other author still gets the full review posted, but as a comment only, plus a
+# Slack DM asking for the final approval call.
+TRUSTED_AUTHORS="${PRSMASH_TRUSTED_AUTHORS-jaythegeek,corixdean,gsasu,beddial}"
+# Reaction-driven approval. A PR held back for a human gets a DM; reacting to
+# that DM approves or drops it, and the next run picks the reaction up. The
+# first emoji in each list is the one the DM tells you to use.
+APPROVE_REACTIONS="${PRSMASH_APPROVE_REACTIONS:-+1,thumbsup,white_check_mark,heavy_check_mark}"
+REJECT_REACTIONS="${PRSMASH_REJECT_REACTIONS:--1,thumbsdown,x,no_entry_sign}"
+# Pending approvals this old are dropped rather than left waiting forever.
+APPROVAL_PENDING_TTL_DAYS="${PRSMASH_APPROVAL_PENDING_TTL_DAYS:-14}"
+# Whose reaction counts. Defaults to the Slack user the tokens belong to.
+APPROVAL_ACTOR="${PRSMASH_SLACK_APPROVAL_USER:-}"
 # Hard cap on a single review. A review agent can spawn a child that never exits
 # (e.g. importing react-dom/server.browser.js under node keeps the event loop
 # alive forever), which otherwise wedges the run, the systemd unit, and every
@@ -45,6 +63,7 @@ while [[ $# -gt 0 ]]; do
     --all|--no-select) SKIP_SELECT=true; shift ;;
     --include-implicit) INCLUDE_IMPLICIT=true; shift ;;
     --approval-line-limit) [[ -n "${2:-}" ]] || { echo "--approval-line-limit requires a value" >&2; exit 1; }; echo "Warning: --approval-line-limit is ignored; prsmash now approves eligible PRs regardless of size." >&2; shift 2 ;;
+    --trusted-authors) TRUSTED_AUTHORS="${2-}"; [[ $# -ge 2 ]] || { echo "--trusted-authors requires a value" >&2; exit 1; }; shift 2 ;;
     --model) MODEL="${2:-}"; [[ -n "$MODEL" ]] || { echo "--model requires a value" >&2; exit 1; }; shift 2 ;;
     --thinking) THINKING_LEVEL="${2:-}"; [[ -n "$THINKING_LEVEL" ]] || { echo "--thinking requires a value" >&2; exit 1; }; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
@@ -54,6 +73,8 @@ done
 # --- Locks and logs ---
 LOG_ROOT="${PRSMASH_LOG_DIR:-$HOME/.prsmash}"
 mkdir -p "$LOG_ROOT/locks"
+PENDING_DIR="$LOG_ROOT/pending-approvals"
+PROCESSED_DIR="$LOG_ROOT/processed-approvals"
 
 # The whole-process lock keeps two interactive runs from fighting over the same
 # queue. Scheduled runs opt out: per-PR flocks (see review_pr) already make
@@ -219,6 +240,11 @@ echo -e "${DIM}Run logs: ${RUN_DIR}${RESET}"
 echo -e "${DIM}Source repo: ${PRSMASH_SOURCE_REPO}${RESET}"
 echo -e "${DIM}Model: ${MODEL}${RESET}"
 echo -e "${DIM}Thinking: ${THINKING_LEVEL}${RESET}"
+if [[ -n "${TRUSTED_AUTHORS//[[:space:],;]/}" ]]; then
+  echo -e "${DIM}Auto-approve authors: ${TRUSTED_AUTHORS}${RESET}"
+else
+  echo -e "${YELLOW}Auto-approve authors: (none set — every eligible PR will be approved)${RESET}"
+fi
 echo -e "${DIM}Approval Slack DM target: ${SLACK_APPROVAL_TARGET}${RESET}"
 echo ""
 
@@ -226,6 +252,383 @@ if ! git -C "$PRSMASH_SOURCE_REPO" rev-parse --is-inside-work-tree >/dev/null 2>
   echo "PRSMASH_SOURCE_REPO is not a git worktree: $PRSMASH_SOURCE_REPO" >&2
   exit 1
 fi
+
+log_field() {
+  local log_file=$1
+  local name=$2
+  grep -m1 "^${name}=" "$log_file" 2>/dev/null | cut -d= -f2- || true
+}
+
+approval_line_summary() {
+  local log_file=$1
+  local changed additions deletions base_oid head_oid worktree shortstat files
+
+  base_oid=$(log_field "$log_file" baseRefOid)
+  head_oid=$(log_field "$log_file" headRefOid)
+  worktree=$(log_field "$log_file" worktree)
+  if [[ -n "$base_oid" && -n "$head_oid" && -n "$worktree" && -d "$worktree" ]]; then
+    shortstat=$(git -C "$worktree" diff --shortstat "${base_oid}...${head_oid}" 2>/dev/null || true)
+    additions=$(grep -oE '[0-9]+ insertions?\(\+\)' <<<"$shortstat" | awk '{print $1}' || true)
+    deletions=$(grep -oE '[0-9]+ deletions?\(-\)' <<<"$shortstat" | awk '{print $1}' || true)
+    files=$(grep -oE '[0-9]+ files? changed' <<<"$shortstat" | awk '{print $1}' || true)
+    additions=${additions:-0}
+    deletions=${deletions:-0}
+    changed=$((additions + deletions))
+    if [[ -n "$files" ]]; then
+      printf '%s changed lines (+%s/-%s, %s files)' "$changed" "$additions" "$deletions" "$files"
+    else
+      printf '%s changed lines (+%s/-%s)' "$changed" "$additions" "$deletions"
+    fi
+    return 0
+  fi
+
+  printf 'changed line count unavailable'
+}
+
+slack_available() {
+  local what=${1:-Slack}
+  [[ "$SLACK_APPROVAL_NOTIFY" == "true" ]] || return 1
+  [[ -x "$SLACK_SCRIPT" ]] || { echo -e "${DIM}Slack ${what} skipped: ${SLACK_SCRIPT} not executable${RESET}"; return 1; }
+  [[ -n "${SLACK_MCP_XOXC_TOKEN:-}" && -n "${SLACK_MCP_XOXD_TOKEN:-}" ]] || { echo -e "${DIM}Slack ${what} skipped: Slack tokens not in environment${RESET}"; return 1; }
+  return 0
+}
+
+# Our GitHub login. Approvals are checked before the queue fetch that sets
+# $user, so fall back to asking gh directly and cache the answer.
+GITHUB_LOGIN=""
+github_login() {
+  if [[ -z "$GITHUB_LOGIN" ]]; then
+    if [[ -n "${user:-}" && "$user" != "null" ]]; then
+      GITHUB_LOGIN="$user"
+    else
+      GITHUB_LOGIN=$(gh api user --jq .login 2>/dev/null) || return 1
+    fi
+  fi
+  [[ -n "$GITHUB_LOGIN" ]] || return 1
+  printf '%s' "$GITHUB_LOGIN"
+}
+
+approval_actor() {
+  local profile
+  if [[ -n "$APPROVAL_ACTOR" ]]; then
+    printf '%s' "$APPROVAL_ACTOR"
+    return 0
+  fi
+  profile=$("$SLACK_SCRIPT" profile 2>/dev/null) || return 1
+  jq -r '.user_id // empty' <<<"$profile" 2>/dev/null
+}
+
+notify_approval_slack() {
+  local kind=$1
+  local pr_number=$2
+  local pr_repo=$3
+  local pr_title=$4
+  local pr_author=$5
+  local log_file=$6
+  local head_oid marker_dir marker_file safe_key line_summary pr_url target channel message reason
+
+  slack_available "notification" || return 0
+
+  head_oid=$(log_field "$log_file" headRefOid)
+  safe_key=$(printf '%s-%s-%s-%s' "$kind" "$pr_repo" "$pr_number" "${head_oid:-unknown-head}" | tr '/:' '__')
+  marker_dir="$LOG_ROOT/approval-notifications"
+  marker_file="$marker_dir/${safe_key}.sent"
+  if [[ -f "$marker_file" ]]; then
+    echo -e "${DIM}Slack notification already sent for #${pr_number} at ${head_oid:-unknown head}${RESET}"
+    return 0
+  fi
+
+  mkdir -p "$marker_dir"
+  pr_url="https://github.com/${pr_repo}/pull/${pr_number}"
+  line_summary=$(approval_line_summary "$log_file")
+
+  if [[ "$kind" == "awaiting-approval" ]]; then
+    # Not log_field: the marker comes from the agent's tool output, so it can be
+    # indented or prefixed rather than sitting at the start of a line.
+    reason=$(grep -m1 -oE 'PRSMASH_MANUAL_APPROVAL_REASON_CODE=[a-z-]+' "$log_file" 2>/dev/null | cut -d= -f2 || true)
+    case "$reason" in
+      untrusted-author|"") reason="the author is not on the auto-approve list" ;;
+      approval-line-limit) reason="the PR is over the automated approval size limit" ;;
+      *) reason="$reason" ;;
+    esac
+    message=$(printf 'Needs your approval: PR #%s\n%s\n%s\nprsmash reviewed this and found nothing blocking, but held off approving because %s.\nAuthor: %s\nLines: %s\nReact :%s: to approve it, :%s: to leave it.\nLog: %s' \
+      "$pr_number" \
+      "$pr_title" \
+      "$pr_url" \
+      "$reason" \
+      "$pr_author" \
+      "$line_summary" \
+      "${APPROVE_REACTIONS%%,*}" \
+      "${REJECT_REACTIONS%%,*}" \
+      "$log_file")
+  else
+    message=$(printf 'PR approved by prsmash\n#%s — %s\n%s\nLines: %s\nAuthor: %s\nLog: %s' \
+      "$pr_number" \
+      "$pr_title" \
+      "$pr_url" \
+      "$line_summary" \
+      "$pr_author" \
+      "$log_file")
+  fi
+
+  if [[ -n "${PRSMASH_SLACK_APPROVAL_CHANNEL:-}" ]]; then
+    channel="$PRSMASH_SLACK_APPROVAL_CHANNEL"
+  else
+    target="$SLACK_APPROVAL_TARGET"
+    if ! channel=$("$SLACK_SCRIPT" resolve "$target" 2>/dev/null); then
+      echo -e "${DIM}Slack notification skipped: could not resolve ${target}${RESET}"
+      return 0
+    fi
+  fi
+
+  local send_output message_ts
+  if send_output=$(printf '%s\n' "$message" | "$SLACK_SCRIPT" send "$channel" - 2>/dev/null); then
+    date -Is > "$marker_file"
+    echo -e "${DIM}Slack ${kind} notification sent for #${pr_number}${RESET}"
+    if [[ "$kind" == "awaiting-approval" ]]; then
+      message_ts=$(jq -r '.ts // empty' <<<"$send_output" 2>/dev/null || true)
+      if [[ -n "$message_ts" ]]; then
+        record_pending_approval "$safe_key" "$pr_number" "$pr_repo" "$pr_title" "$pr_author" \
+          "${head_oid:-}" "$channel" "$message_ts"
+      else
+        echo -e "${YELLOW}Could not read the Slack message ts for #${pr_number}; reaction approval is unavailable for it${RESET}" >&2
+      fi
+    fi
+  else
+    echo -e "${DIM}Slack ${kind} notification failed for #${pr_number}${RESET}"
+  fi
+}
+
+record_pending_approval() {
+  local key=$1 pr_number=$2 pr_repo=$3 pr_title=$4 pr_author=$5 head_oid=$6 channel=$7 message_ts=$8
+  local tmp="$PENDING_DIR/.${key}.tmp"
+
+  mkdir -p "$PENDING_DIR"
+  if jq -n \
+      --arg repo "$pr_repo" \
+      --argjson pr "$pr_number" \
+      --arg title "$pr_title" \
+      --arg author "$pr_author" \
+      --arg head "$head_oid" \
+      --arg channel "$channel" \
+      --arg ts "$message_ts" \
+      --arg createdAt "$(date -Is)" \
+      '{repo: $repo, pr: $pr, title: $title, author: $author, head: $head, channel: $channel, ts: $ts, createdAt: $createdAt}' \
+      > "$tmp"; then
+    mv "$tmp" "$PENDING_DIR/${key}.json"
+    echo -e "${DIM}Awaiting a Slack reaction on #${pr_number} to approve${RESET}"
+  else
+    rm -f "$tmp"
+    echo -e "${YELLOW}Could not record the pending approval for #${pr_number}${RESET}" >&2
+  fi
+}
+
+in_reaction_set() {
+  local name=$1 set=$2
+  printf '%s\n' "${set//,/$'\n'}" | grep -Fxq -- "$name"
+}
+
+# approve | reject | none | error. A reject alongside an approve wins, so a
+# mind changed by adding the opposite reaction fails safe.
+reaction_decision() {
+  local channel=$1 message_ts=$2 actor=$3
+  local resp name approve=false reject=false
+
+  resp=$("$SLACK_SCRIPT" reactions "$channel" "$message_ts" 2>/dev/null) || { echo error; return 0; }
+  jq -e 'type == "array"' >/dev/null 2>&1 <<<"$resp" || { echo error; return 0; }
+
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    if in_reaction_set "$name" "$APPROVE_REACTIONS"; then approve=true; fi
+    if in_reaction_set "$name" "$REJECT_REACTIONS"; then reject=true; fi
+  done < <(jq -r --arg actor "$actor" '.[] | select((.users // []) | index($actor)) | .name' <<<"$resp")
+
+  if [[ "$reject" == true ]]; then
+    echo reject
+  elif [[ "$approve" == true ]]; then
+    echo approve
+  else
+    echo none
+  fi
+}
+
+reply_in_slack_thread() {
+  local channel=$1 message_ts=$2 text=$3
+  printf '%s\n' "$text" | "$SLACK_SCRIPT" send "$channel" - "$message_ts" >/dev/null 2>&1 || true
+}
+
+# Retire a pending approval. The record moves to processed/ with its outcome, so
+# the same reaction is never acted on twice and there is a trail of what happened.
+finish_pending_approval() {
+  local file=$1 outcome=$2
+  local base tmp
+  base=$(basename "$file")
+  tmp="$PROCESSED_DIR/.${base}.tmp"
+
+  mkdir -p "$PROCESSED_DIR"
+  if jq --arg outcome "$outcome" --arg at "$(date -Is)" \
+      '. + {outcome: $outcome, processedAt: $at}' "$file" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$PROCESSED_DIR/$base"
+    rm -f "$file"
+  else
+    rm -f "$tmp"
+    # Never leave it pending after acting — a stale record would replay.
+    mv "$file" "$PROCESSED_DIR/$base" 2>/dev/null || rm -f "$file"
+  fi
+}
+
+apply_slack_approval() {
+  local file=$1 pr_repo=$2 pr_number=$3 head_oid=$4 channel=$5 message_ts=$6
+  local pr_json pr_state pr_merged current_head already me
+
+  if ! me=$(github_login); then
+    echo -e "${YELLOW}Could not determine our GitHub login; leaving #${pr_number} pending${RESET}" >&2
+    return 0
+  fi
+
+  pr_json=$(gh api "repos/${pr_repo}/pulls/${pr_number}" 2>/dev/null) || {
+    # Transient GitHub failure: leave it pending and retry on the next run.
+    echo -e "${YELLOW}Could not read PR #${pr_number} to apply your approval; will retry${RESET}" >&2
+    return 0
+  }
+  pr_state=$(jq -r '.state // ""' <<<"$pr_json")
+  pr_merged=$(jq -r '.merged // false' <<<"$pr_json")
+  current_head=$(jq -r '.head.sha // ""' <<<"$pr_json")
+
+  if [[ "$pr_merged" == "true" || "$pr_state" != "open" ]]; then
+    local disposition="closed"
+    [[ "$pr_merged" == "true" ]] && disposition="merged"
+    echo -e "  ${DIM}#${pr_number} was ${disposition} before you approved it — nothing to do${RESET}"
+    finish_pending_approval "$file" "closed-before-approval"
+    return 0
+  fi
+
+  if [[ -n "$head_oid" && "$current_head" != "$head_oid" ]]; then
+    echo -e "  ${YELLOW}#${pr_number} moved on since that review — not approving${RESET}"
+    reply_in_slack_thread "$channel" "$message_ts" \
+      "Not approving: the PR has new commits since that review. prsmash will review the new head and ask again."
+    finish_pending_approval "$file" "stale-head"
+    return 0
+  fi
+
+  already=$(gh api --paginate --slurp "repos/${pr_repo}/pulls/${pr_number}/reviews" 2>/dev/null \
+    | jq -r --arg me "$me" --arg sha "$current_head" \
+        '[.[] | .[] | select(.user.login == $me and .state == "APPROVED" and .commit_id == $sha)] | length' 2>/dev/null || echo 0)
+  if [[ "$already" =~ ^[0-9]+$ ]] && [[ "$already" -gt 0 ]]; then
+    echo -e "  ${DIM}#${pr_number} is already approved at this commit${RESET}"
+    finish_pending_approval "$file" "already-approved"
+    return 0
+  fi
+
+  if gh api "repos/${pr_repo}/pulls/${pr_number}/reviews" \
+      --method POST \
+      -f event=APPROVE \
+      -f commit_id="$current_head" \
+      -f body="Approved on the reviewer's sign-off in Slack, following the automated review above." \
+      >/dev/null 2>&1; then
+    echo -e "  ${GREEN}Approved #${pr_number}${RESET} ${DIM}on your Slack reaction${RESET}"
+    reply_in_slack_thread "$channel" "$message_ts" "Approved #${pr_number}"
+    finish_pending_approval "$file" "approved"
+  else
+    echo -e "  ${RED}Could not approve #${pr_number}; will retry${RESET}" >&2
+  fi
+}
+
+handle_pending_approval() {
+  local file=$1 actor=$2
+  local pr_repo pr_number head_oid channel message_ts decision
+
+  pr_repo=$(jq -r '.repo // ""' "$file" 2>/dev/null || true)
+  pr_number=$(jq -r '.pr // ""' "$file" 2>/dev/null || true)
+  head_oid=$(jq -r '.head // ""' "$file" 2>/dev/null || true)
+  channel=$(jq -r '.channel // ""' "$file" 2>/dev/null || true)
+  message_ts=$(jq -r '.ts // ""' "$file" 2>/dev/null || true)
+
+  if [[ -z "$pr_repo" || -z "$pr_number" || -z "$channel" || -z "$message_ts" ]]; then
+    echo -e "  ${YELLOW}Discarding unreadable pending approval $(basename "$file")${RESET}" >&2
+    finish_pending_approval "$file" "unreadable"
+    return 0
+  fi
+
+  decision=$(reaction_decision "$channel" "$message_ts" "$actor")
+
+  if [[ "$DRY_RUN" == true ]]; then
+    echo -e "  ${DIM}#${pr_number} (${pr_repo}) — reaction: ${decision}${RESET}"
+    return 0
+  fi
+
+  case "$decision" in
+    approve) apply_slack_approval "$file" "$pr_repo" "$pr_number" "$head_oid" "$channel" "$message_ts" ;;
+    reject)
+      echo -e "  ${DIM}#${pr_number} left unapproved on your reaction${RESET}"
+      reply_in_slack_thread "$channel" "$message_ts" "Left unapproved. The review comment stays on the PR."
+      finish_pending_approval "$file" "rejected" ;;
+    error)
+      echo -e "  ${YELLOW}Could not read reactions for #${pr_number}; will retry${RESET}" >&2 ;;
+    *) : ;;
+  esac
+}
+
+# Pending approvals are checked at the start of every run, so a reaction is
+# picked up by the next tick without a second poller. A dedicated lock keeps
+# overlapping runs from racing on the same record.
+process_pending_approvals() {
+  local file actor lock_fd expired
+  local files=()
+
+  shopt -s nullglob
+  files=("$PENDING_DIR"/*.json)
+  shopt -u nullglob
+  [[ ${#files[@]} -gt 0 ]] || return 0
+
+  if ! slack_available "pending approval check"; then
+    echo -e "${DIM}${#files[@]} approval(s) still waiting on a Slack reaction${RESET}"
+    return 0
+  fi
+
+  exec {lock_fd}>"$LOG_ROOT/locks/approvals.lock"
+  if ! flock -n "$lock_fd"; then
+    echo -e "${DIM}Another run is checking pending approvals; skipping${RESET}"
+    exec {lock_fd}>&-
+    return 0
+  fi
+
+  if ! actor=$(approval_actor) || [[ -z "$actor" ]]; then
+    echo -e "${YELLOW}Could not determine whose Slack reactions to trust; skipping approval check${RESET}" >&2
+    exec {lock_fd}>&-
+    return 0
+  fi
+
+  # Drop anything that has sat unanswered past the TTL before spending API calls.
+  if [[ "$APPROVAL_PENDING_TTL_DAYS" =~ ^[0-9]+$ ]] && [[ "$APPROVAL_PENDING_TTL_DAYS" -gt 0 ]] && [[ "$DRY_RUN" != true ]]; then
+    while IFS= read -r expired; do
+      [[ -n "$expired" ]] || continue
+      echo -e "  ${DIM}Dropping approval for $(basename "$expired" .json) after ${APPROVAL_PENDING_TTL_DAYS} days${RESET}"
+      finish_pending_approval "$expired" "expired"
+    done < <(find "$PENDING_DIR" -maxdepth 1 -name '*.json' -mtime "+${APPROVAL_PENDING_TTL_DAYS}" 2>/dev/null)
+
+    shopt -s nullglob
+    files=("$PENDING_DIR"/*.json)
+    shopt -u nullglob
+  fi
+
+  if [[ ${#files[@]} -gt 0 ]]; then
+    echo -e "${DIM}Checking ${#files[@]} pending approval(s) for Slack reactions...${RESET}"
+    for file in "${files[@]}"; do
+      [[ -f "$file" ]] || continue
+      handle_pending_approval "$file" "$actor"
+    done
+    echo ""
+  fi
+
+  exec {lock_fd}>&-
+}
+
+# --- Pending approvals ---
+# Ahead of the queue fetch, because every path out of the queue section can exit
+# early — an empty queue is the common case, and a reaction left since the last
+# run still has to be applied.
+process_pending_approvals
 
 # --- Fetch queue ---
 echo -e "${DIM}Fetching review queue...${RESET}"
@@ -485,7 +888,7 @@ run_pr_review() {
   fi
 
   local rc=0
-  (cd "$worktree_dir" && TMPDIR="$tmp_dir" PR_REVIEW_TMPDIR="$tmp_dir" PRSMASH_APPROVAL_LINE_LIMIT= PRSMASH_APPROVAL_MAX_LINES= "${runner[@]}") || rc=$?
+  (cd "$worktree_dir" && TMPDIR="$tmp_dir" PR_REVIEW_TMPDIR="$tmp_dir" PRSMASH_APPROVAL_LINE_LIMIT= PRSMASH_APPROVAL_MAX_LINES= PRSMASH_TRUSTED_AUTHORS="$TRUSTED_AUTHORS" "${runner[@]}") || rc=$?
   if [[ $rc -eq 124 || $rc -eq 137 ]]; then
     echo "PRSMASH_REVIEW_TIMEOUT: killed after ${REVIEW_TIMEOUT}s"
   fi
@@ -512,88 +915,6 @@ append_latest_review_body() {
       || echo "Failed to fetch posted GitHub review body."
     echo "========== End posted GitHub review =========="
   } >> "$log_file"
-}
-
-log_field() {
-  local log_file=$1
-  local name=$2
-  grep -m1 "^${name}=" "$log_file" 2>/dev/null | cut -d= -f2- || true
-}
-
-approval_line_summary() {
-  local log_file=$1
-  local changed additions deletions base_oid head_oid worktree shortstat files
-
-  base_oid=$(log_field "$log_file" baseRefOid)
-  head_oid=$(log_field "$log_file" headRefOid)
-  worktree=$(log_field "$log_file" worktree)
-  if [[ -n "$base_oid" && -n "$head_oid" && -n "$worktree" && -d "$worktree" ]]; then
-    shortstat=$(git -C "$worktree" diff --shortstat "${base_oid}...${head_oid}" 2>/dev/null || true)
-    additions=$(grep -oE '[0-9]+ insertions?\(\+\)' <<<"$shortstat" | awk '{print $1}' || true)
-    deletions=$(grep -oE '[0-9]+ deletions?\(-\)' <<<"$shortstat" | awk '{print $1}' || true)
-    files=$(grep -oE '[0-9]+ files? changed' <<<"$shortstat" | awk '{print $1}' || true)
-    additions=${additions:-0}
-    deletions=${deletions:-0}
-    changed=$((additions + deletions))
-    if [[ -n "$files" ]]; then
-      printf '%s changed lines (+%s/-%s, %s files)' "$changed" "$additions" "$deletions" "$files"
-    else
-      printf '%s changed lines (+%s/-%s)' "$changed" "$additions" "$deletions"
-    fi
-    return 0
-  fi
-
-  printf 'changed line count unavailable'
-}
-
-notify_approval_slack() {
-  local pr_number=$1
-  local pr_repo=$2
-  local pr_title=$3
-  local pr_author=$4
-  local log_file=$5
-  local head_oid marker_dir marker_file safe_key line_summary pr_url target channel message
-
-  [[ "$SLACK_APPROVAL_NOTIFY" == "true" ]] || return 0
-  [[ -x "$SLACK_SCRIPT" ]] || { echo -e "${DIM}Slack approval notification skipped: ${SLACK_SCRIPT} not executable${RESET}"; return 0; }
-  [[ -n "${SLACK_MCP_XOXC_TOKEN:-}" && -n "${SLACK_MCP_XOXD_TOKEN:-}" ]] || { echo -e "${DIM}Slack approval notification skipped: Slack tokens not in environment${RESET}"; return 0; }
-
-  head_oid=$(log_field "$log_file" headRefOid)
-  safe_key=$(printf '%s-%s-%s' "$pr_repo" "$pr_number" "${head_oid:-unknown-head}" | tr '/:' '__')
-  marker_dir="$LOG_ROOT/approval-notifications"
-  marker_file="$marker_dir/${safe_key}.sent"
-  if [[ -f "$marker_file" ]]; then
-    echo -e "${DIM}Slack approval notification already sent for #${pr_number} at ${head_oid:-unknown head}${RESET}"
-    return 0
-  fi
-
-  mkdir -p "$marker_dir"
-  pr_url="https://github.com/${pr_repo}/pull/${pr_number}"
-  line_summary=$(approval_line_summary "$log_file")
-  message=$(printf 'PR approved by prsmash\n#%s — %s\n%s\nLines: %s\nAuthor: %s\nLog: %s' \
-    "$pr_number" \
-    "$pr_title" \
-    "$pr_url" \
-    "$line_summary" \
-    "$pr_author" \
-    "$log_file")
-
-  if [[ -n "${PRSMASH_SLACK_APPROVAL_CHANNEL:-}" ]]; then
-    channel="$PRSMASH_SLACK_APPROVAL_CHANNEL"
-  else
-    target="$SLACK_APPROVAL_TARGET"
-    if ! channel=$("$SLACK_SCRIPT" resolve "$target" 2>/dev/null); then
-      echo -e "${DIM}Slack approval notification skipped: could not resolve ${target}${RESET}"
-      return 0
-    fi
-  fi
-
-  if printf '%s\n' "$message" | "$SLACK_SCRIPT" send "$channel" - >/dev/null 2>&1; then
-    date -Is > "$marker_file"
-    echo -e "${DIM}Slack approval notification sent for #${pr_number}${RESET}"
-  else
-    echo -e "${DIM}Slack approval notification failed for #${pr_number}${RESET}"
-  fi
 }
 
 review_pr_bg() {
@@ -716,11 +1037,12 @@ while [[ $completed -lt $total ]]; do
   case "${result}:${latest_state}" in
     OK:APPROVED)
       echo -e "${prefix} ${GREEN}Approved${RESET} ${suffix}"
-      notify_approval_slack "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$log_file" || true
+      notify_approval_slack approved "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$log_file" || true
       approved=$((approved + 1))
       reviewed=$((reviewed + 1)) ;;
     OK:MANUAL_APPROVAL_REQUIRED)
-      echo -e "${prefix} ${YELLOW}Manual approval needed${RESET} ${suffix} ${DIM}— unexpected; prsmash no longer sets an approval line limit${RESET}"
+      echo -e "${prefix} ${YELLOW}Review posted, awaiting your approval${RESET} ${suffix}"
+      notify_approval_slack awaiting-approval "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$log_file" || true
       manual_approval=$((manual_approval + 1))
       reviewed=$((reviewed + 1)) ;;
     OK:CHANGES_REQUESTED)
@@ -745,7 +1067,7 @@ reviewed=$reviewed
 errored=$errored
 skipped=$skipped
 approved=$approved
-manual_approval_unexpected=$manual_approval
+awaiting_manual_approval=$manual_approval
 changes_requested=$changes_requested
 EOF
 
@@ -758,6 +1080,6 @@ if [[ "$skipped" -gt 0 ]]; then
   echo -e "  ${YELLOW}${skipped} skipped${RESET} ${DIM}— already being reviewed by another run${RESET}"
 fi
 if [[ "$manual_approval" -gt 0 ]]; then
-  echo -e "  ${YELLOW}${manual_approval} unexpected manual-approval downgrades${RESET}"
+  echo -e "  ${YELLOW}${manual_approval} awaiting your approval${RESET} ${DIM}— review posted, approval left to you${RESET}"
 fi
 echo -e "  ${DIM}logs: ${RUN_DIR}${RESET}"
