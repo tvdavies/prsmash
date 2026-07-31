@@ -19,6 +19,14 @@ Environment=PRSMASH_MAX_CONCURRENT_RUNS=4
 Environment=PRSMASH_LOG_DIR=/home/tvd/.prsmash
 Environment=PATH=/home/tvd/.pi/agent/bin:/home/tvd/.local/bin:/home/tvd/.local/share/nvm/v24.15.0/bin:/usr/bin:/bin:/opt/google-cloud-cli/bin
 
+# pi only registers its anthropic-claude-code provider when these point at the
+# local cli-proxy-api; ~/.pi/agent/auth.json has no claude-code entry, so there
+# is no OAuth fallback. They are set in ~/.config/fish/fish_variables, which the
+# systemd user manager never reads, so without them every review dies in seconds
+# on `Model "anthropic-claude-code/claude-opus-5" not found`.
+Environment=PI_CLAUDE_CODE_API_KEY_FILE=/home/tvd/.cli-proxy-api/proxy.key
+Environment=PI_CLAUDE_CODE_BASE_URL=http://127.0.0.1:8317
+
 # $$ escapes a literal $ for the shell: systemd expands ${VAR} itself and does
 # not understand :- defaults, so every shell variable and substitution below has
 # to survive systemd's own pass. %% likewise yields a literal % for date(1).
@@ -37,6 +45,8 @@ ExecStart=/bin/sh -c ' \
     --working-directory=/home/tvd/dev/lleverage-ai/lleverage \
     --setenv=PATH="$$PATH" \
     --setenv=PRSMASH_LOG_DIR="$$PRSMASH_LOG_DIR" \
+    --setenv=PI_CLAUDE_CODE_API_KEY_FILE="$$PI_CLAUDE_CODE_API_KEY_FILE" \
+    --setenv=PI_CLAUDE_CODE_BASE_URL="$$PI_CLAUDE_CODE_BASE_URL" \
     --setenv=PRSMASH_ALLOW_CONCURRENT=1 \
     --property=RuntimeMaxSec=3600 \
     /home/tvd/.local/bin/prsmash --all'
