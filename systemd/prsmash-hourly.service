@@ -27,6 +27,12 @@ Environment=PATH=/home/tvd/.pi/agent/bin:/home/tvd/.local/bin:/home/tvd/.local/s
 Environment=PI_CLAUDE_CODE_API_KEY_FILE=/home/tvd/.cli-proxy-api/proxy.key
 Environment=PI_CLAUDE_CODE_BASE_URL=http://127.0.0.1:8317
 
+# Slack approval DMs need the browser tokens, which otherwise only exist in
+# fish's config.fish (never read by the systemd user manager). They are secrets,
+# so they live in a 600-mode file outside this repo; the leading - makes a
+# missing file non-fatal, in which case prsmash just logs that Slack is skipped.
+EnvironmentFile=-/home/tvd/.prsmash/slack.env
+
 # $$ escapes a literal $ for the shell: systemd expands ${VAR} itself and does
 # not understand :- defaults, so every shell variable and substitution below has
 # to survive systemd's own pass. %% likewise yields a literal % for date(1).
@@ -47,6 +53,8 @@ ExecStart=/bin/sh -c ' \
     --setenv=PRSMASH_LOG_DIR="$$PRSMASH_LOG_DIR" \
     --setenv=PI_CLAUDE_CODE_API_KEY_FILE="$$PI_CLAUDE_CODE_API_KEY_FILE" \
     --setenv=PI_CLAUDE_CODE_BASE_URL="$$PI_CLAUDE_CODE_BASE_URL" \
+    --setenv=SLACK_MCP_XOXC_TOKEN="$$SLACK_MCP_XOXC_TOKEN" \
+    --setenv=SLACK_MCP_XOXD_TOKEN="$$SLACK_MCP_XOXD_TOKEN" \
     --setenv=PRSMASH_ALLOW_CONCURRENT=1 \
     --property=RuntimeMaxSec=3600 \
     /home/tvd/.local/bin/prsmash --all'
