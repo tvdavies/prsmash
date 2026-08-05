@@ -83,8 +83,10 @@ reviews are posted normally whoever the author is, and the gate never
 turns a pass into a fail — an ungated PR gets the same verdict, just
 without the green tick.
 
-Slack DMs are deduplicated per PR head SHA, so you are pinged once per
-pushed state, not once per run.
+Reviews posted as issue comments, including manual-gated reviews, are
+deduplicated per PR head SHA. Once an exact head has passed automated review,
+scheduled runs skip it rather than repeatedly reviewing code GitHub still shows
+as review-requested. A pushed commit has a new SHA and is reviewed normally.
 
 ## Approving from Slack
 
@@ -102,7 +104,10 @@ Checking 2 pending approval(s) for Slack reactions...
 Each decision is applied exactly once. A pending approval is a JSON
 record in `pending-approvals/`; acting on it moves the record to
 `processed-approvals/` with its outcome, so the same reaction is never
-replayed. Three further guards sit behind that:
+replayed. The reviewed head is recorded independently in
+`review-dispositions/`, so a missing or unavailable Slack integration cannot
+cause the expensive automated review to run again. Three further guards sit
+behind that:
 
 - A dedicated lock, so overlapping runs never race the same record.
 - The approval is refused if the PR head has moved since the review —
@@ -157,8 +162,9 @@ Then point it at your setup (env vars, with these defaults):
 | `PRSMASH_SOURCE_REPO` | `~/dev/lleverage-ai/lleverage` | Local clone of the repo whose PRs you review |
 | `PR_REVIEW_SKILL_DIR` | `~/agent-skills/skills/pr-review` | The pi `pr-review` skill directory |
 | `PRSMASH_QUEUE_SCRIPT` | `~/.claude/skills/review-queue/scripts/review-queue.sh` | Queue script (a copy lives in `lib/review-queue.sh`) |
-| `PI_PRSMASH_MODEL` | `anthropic-claude-code/claude-opus-5` | Model passed to `pi --model` |
+| `PI_PRSMASH_MODEL` | `openai-codex/gpt-5.6-sol` | Model passed to `pi --model` |
 | `PRSMASH_TRUSTED_AUTHORS` | `jaythegeek,corixdean,gsasu,beddial` | Authors whose PRs may be approved automatically (empty disables the gate) |
+| `PI_PRSMASH_THINKING` | `high` | Reasoning level passed to `pi --thinking` |
 | `PRSMASH_REVIEW_TIMEOUT` | `2700` | Seconds before a single review is killed (p99 is ~32m) |
 | `PRSMASH_LOG_DIR` | `~/.prsmash` | Locks, run logs, notification markers |
 | `PRSMASH_SLACK_SCRIPT` | `~/.claude/skills/slack/scripts/slack.sh` | Slack send helper |

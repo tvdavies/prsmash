@@ -7,7 +7,7 @@
 #   prsmash --all        # review every PR in the queue, no prompt
 #   prsmash --dry-run    # show what would be reviewed
 #   prsmash --include-implicit  # include implicit re-review candidates in manual mode
-#   prsmash --model anthropic-claude-code/claude-opus-5 --thinking high
+#   prsmash --model openai-codex/gpt-5.6-sol --thinking high
 #   prsmash --trusted-authors alice,bob   # only auto-approve these authors ('' disables gating)
 #
 # PRs by authors outside the trusted list get their review posted as a comment
@@ -18,6 +18,10 @@ set -eo pipefail
 
 QUEUE_SCRIPT="${PRSMASH_QUEUE_SCRIPT:-$HOME/.claude/skills/review-queue/scripts/review-queue.sh}"
 PR_REVIEW_SKILL_DIR="${PR_REVIEW_SKILL_DIR:-$HOME/agent-skills/skills/pr-review}"
+PRSMASH_SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}")
+PRSMASH_LIB_DIR="${PRSMASH_LIB_DIR:-$(dirname "$PRSMASH_SCRIPT_PATH")/../lib}"
+# shellcheck source=../lib/review-disposition-state.sh
+source "$PRSMASH_LIB_DIR/review-disposition-state.sh"
 PRSMASH_SOURCE_REPO="${PRSMASH_SOURCE_REPO:-$HOME/dev/lleverage-ai/lleverage}"
 SLACK_SCRIPT="${PRSMASH_SLACK_SCRIPT:-$HOME/.claude/skills/slack/scripts/slack.sh}"
 SLACK_APPROVAL_NOTIFY="${PRSMASH_SLACK_APPROVAL_NOTIFY:-true}"
@@ -55,7 +59,7 @@ RESET='\033[0m'
 DRY_RUN=false
 SKIP_SELECT=false
 INCLUDE_IMPLICIT=false
-MODEL="${PI_PRSMASH_MODEL:-anthropic-claude-code/claude-opus-5}"
+MODEL="${PI_PRSMASH_MODEL:-openai-codex/gpt-5.6-sol}"
 THINKING_LEVEL="${PI_PRSMASH_THINKING:-high}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -75,6 +79,17 @@ LOG_ROOT="${PRSMASH_LOG_DIR:-$HOME/.prsmash}"
 mkdir -p "$LOG_ROOT/locks"
 PENDING_DIR="$LOG_ROOT/pending-approvals"
 PROCESSED_DIR="$LOG_ROOT/processed-approvals"
+review_disposition_state_init "$LOG_ROOT"
+if [[ "$DRY_RUN" != true ]]; then
+  backfill_approval_review_dispositions "$PENDING_DIR" "$PROCESSED_DIR"
+  disposition_backfill_marker="$LOG_ROOT/.review-disposition-log-backfill-v1"
+  if [[ ! -f "$disposition_backfill_marker" ]]; then
+    backfill_logged_issue_comment_dispositions "$LOG_ROOT/runs"
+    disposition_backfill_tmp=$(mktemp "${disposition_backfill_marker}.tmp.XXXXXX")
+    date -Is > "$disposition_backfill_tmp"
+    mv "$disposition_backfill_tmp" "$disposition_backfill_marker"
+  fi
+fi
 
 # The whole-process lock keeps two interactive runs from fighting over the same
 # queue. Scheduled runs opt out: per-PR flocks (see review_pr) already make
@@ -325,7 +340,7 @@ notify_approval_slack() {
   local pr_title=$4
   local pr_author=$5
   local log_file=$6
-  local head_oid marker_dir marker_file safe_key line_summary pr_url target channel message reason
+  local head_oid marker_dir marker_file safe_key line_summary pr_url target channel message
 
   slack_available "notification" || return 0
 
@@ -343,19 +358,10 @@ notify_approval_slack() {
   line_summary=$(approval_line_summary "$log_file")
 
   if [[ "$kind" == "awaiting-approval" ]]; then
-    # Not log_field: the marker comes from the agent's tool output, so it can be
-    # indented or prefixed rather than sitting at the start of a line.
-    reason=$(grep -m1 -oE 'PRSMASH_MANUAL_APPROVAL_REASON_CODE=[a-z-]+' "$log_file" 2>/dev/null | cut -d= -f2 || true)
-    case "$reason" in
-      untrusted-author|"") reason="the author is not on the auto-approve list" ;;
-      approval-line-limit) reason="the PR is over the automated approval size limit" ;;
-      *) reason="$reason" ;;
-    esac
-    message=$(printf 'Needs your approval: PR #%s\n%s\n%s\nprsmash reviewed this and found nothing blocking, but held off approving because %s.\nAuthor: %s\nLines: %s\nReact :%s: to approve it, :%s: to leave it.\nLog: %s' \
+    message=$(printf 'Needs your approval: PR #%s\n%s\n%s\nprsmash reviewed this and found nothing blocking.\nAuthor: %s\nLines: %s\nReact :%s: to approve it, :%s: to leave it.\nLog: %s' \
       "$pr_number" \
       "$pr_title" \
       "$pr_url" \
-      "$reason" \
       "$pr_author" \
       "$line_summary" \
       "${APPROVE_REACTIONS%%,*}" \
@@ -524,10 +530,8 @@ apply_slack_approval() {
       --method POST \
       -f event=APPROVE \
       -f commit_id="$current_head" \
-      -f body="Approved on the reviewer's sign-off in Slack, following the automated review above." \
       >/dev/null 2>&1; then
     echo -e "  ${GREEN}Approved #${pr_number}${RESET} ${DIM}on your Slack reaction${RESET}"
-    reply_in_slack_thread "$channel" "$message_ts" "Approved #${pr_number}"
     finish_pending_approval "$file" "approved"
   else
     echo -e "  ${RED}Could not approve #${pr_number}; will retry${RESET}" >&2
@@ -665,6 +669,14 @@ fi
 if [[ "$SKIP_SELECT" == true ]]; then
   queue_json=$(echo "$queue_json" | jq '.prs |= map(select(.implicitRereview != true))')
 fi
+
+# Manual and dry-run views can hide exact heads already handled outside GitHub
+# review state. Scheduled runs defer this check until after refreshing the head
+# under the per-PR lock, so a push between queue fetch and launch cannot be lost.
+if [[ "$SKIP_SELECT" != true || "$DRY_RUN" == true ]]; then
+  queue_json=$(filter_review_dispositions "$queue_json")
+fi
+printf '%s\n' "$queue_json" > "$RUN_DIR/queue-filtered.json"
 
 pr_count=$(echo "$queue_json" | jq '.prs | length')
 implicit_count=$(echo "$queue_json" | jq '[.prs[] | select(.implicitRereview == true)] | length')
@@ -854,9 +866,13 @@ run_pr_review() {
   local session_dir="$RUN_DIR/sessions/pr-${pr_number}"
   local worktree_dir="$RUN_DIR/worktrees/pr-${pr_number}"
   local tmp_dir="$RUN_DIR/tmp/pr-${pr_number}"
+  local result_file="$tmp_dir/review-result.json"
   mkdir -p "$session_dir" "$tmp_dir"
+  rm -f "$result_file"
 
   prepare_pr_context "$pr_number" "$pr_repo" "$worktree_dir" "$tmp_dir"
+  local analyzed_head
+  analyzed_head=$(git -C "$worktree_dir" rev-parse HEAD)
 
   # Incremental re-review: when we know the commit our last review looked at,
   # narrow the review to what changed since. Only valid if that commit is an
@@ -888,7 +904,7 @@ run_pr_review() {
   fi
 
   local rc=0
-  (cd "$worktree_dir" && TMPDIR="$tmp_dir" PR_REVIEW_TMPDIR="$tmp_dir" PRSMASH_APPROVAL_LINE_LIMIT= PRSMASH_APPROVAL_MAX_LINES= PRSMASH_TRUSTED_AUTHORS="$TRUSTED_AUTHORS" "${runner[@]}") || rc=$?
+  (cd "$worktree_dir" && TMPDIR="$tmp_dir" PR_REVIEW_TMPDIR="$tmp_dir" PRSMASH_REVIEW_RESULT_FILE="$result_file" PRSMASH_REVIEW_EXPECTED_HEAD="$analyzed_head" PRSMASH_APPROVAL_LINE_LIMIT= PRSMASH_APPROVAL_MAX_LINES= PRSMASH_TRUSTED_AUTHORS="$TRUSTED_AUTHORS" "${runner[@]}") || rc=$?
   if [[ $rc -eq 124 || $rc -eq 137 ]]; then
     echo "PRSMASH_REVIEW_TIMEOUT: killed after ${REVIEW_TIMEOUT}s"
   fi
@@ -923,12 +939,28 @@ review_pr_bg() {
   local log_file=$3
   local status_file=$4
   local since_commit=$5
-  local start end duration attempt=1 latest_state lock_name
+  local head_oid=$6
+  local start end duration attempt=1 latest_state lock_name disposition_source
+  local result_file result_head result_posting result_manual analyzed_head
 
   lock_name=$(printf '%s-%s' "$pr_repo" "$pr_number" | tr '/:' '__')
   exec {pr_lock_fd}>"$LOG_ROOT/locks/pr-${lock_name}.lock"
   if ! flock -n "$pr_lock_fd"; then
     printf 'LOCKED||0\n' > "$status_file"
+    return 0
+  fi
+
+  # The queue may have been fetched while an overlapping run was finishing or
+  # while the author pushed. Refresh GitHub under the per-PR lock, then check the
+  # exact current head against the disposition written by the previous holder.
+  if ! head_oid=$(gh api "repos/${pr_repo}/pulls/${pr_number}" --jq '.head.sha' 2>/dev/null) \
+      || [[ ! "$head_oid" =~ ^[0-9a-fA-F]{7,64}$ ]]; then
+    echo "Could not refresh the current head for ${pr_repo}#${pr_number}; refusing to launch a review." > "$log_file"
+    printf 'ERR||0\n' > "$status_file"
+    return 1
+  fi
+  if review_disposition_exists "$pr_repo" "$pr_number" "$head_oid"; then
+    printf 'HANDLED||0\n' > "$status_file"
     return 0
   fi
 
@@ -948,8 +980,24 @@ review_pr_bg() {
             // "UNKNOWN"
           ' 2>/dev/null || echo "UNKNOWN")
       append_latest_review_body "$pr_number" "$pr_repo" "$log_file"
-      if grep -q 'PRSMASH_MANUAL_APPROVAL_REQUIRED=true' "$log_file" 2>/dev/null; then
-        latest_state="MANUAL_APPROVAL_REQUIRED"
+      disposition_source=""
+      result_file="$RUN_DIR/tmp/pr-${pr_number}/review-result.json"
+      analyzed_head=$(git -C "$RUN_DIR/worktrees/pr-${pr_number}" rev-parse HEAD 2>/dev/null || true)
+      if jq -e --arg repo "$pr_repo" --argjson pr "$pr_number" --arg head "$analyzed_head" \
+          '.repo == $repo and .pr == $pr and .head == $head' "$result_file" >/dev/null 2>&1; then
+        result_head=$(jq -r '.head // empty' "$result_file")
+        result_posting=$(jq -r '.posting // empty' "$result_file")
+        result_manual=$(jq -r '.manualApprovalRequired // false' "$result_file")
+        if [[ "$result_manual" == "true" ]]; then
+          latest_state="MANUAL_APPROVAL_REQUIRED"
+          disposition_source="manual-approval-required"
+        elif [[ "$result_posting" == "issue-comment" ]]; then
+          disposition_source="issue-comment-review"
+        fi
+        if [[ -n "$disposition_source" ]] \
+            && ! record_review_disposition "$pr_repo" "$pr_number" "$result_head" "$disposition_source"; then
+          echo "Could not persist the review disposition for ${pr_repo}#${pr_number} at ${result_head}; this head may be reviewed again." >&2
+        fi
       fi
       printf 'OK|%s|%d\n' "$latest_state" "$duration" > "$status_file"
       return 0
@@ -980,6 +1028,7 @@ for i in $(seq 0 $((pr_count - 1))); do
   implicit_rereview=$(echo "$queue_json" | jq -r ".prs[$i].implicitRereview")
   queue_source=$(echo "$queue_json" | jq -r ".prs[$i].queueSource // \"review-request\"")
   my_review_commit=$(echo "$queue_json" | jq -r ".prs[$i].myReviewCommit // empty")
+  head_oid=$(echo "$queue_json" | jq -r ".prs[$i].headRefOid // empty")
   pr_repo=$(echo "$queue_json" | jq -r ".prs[$i].repository.nameWithOwner")
 
   since_commit=""
@@ -990,7 +1039,7 @@ for i in $(seq 0 $((pr_count - 1))); do
   status_file="$RUN_DIR/pr-${pr_number}.status"
   rm -f "$status_file"
 
-  review_pr_bg "$pr_number" "$pr_repo" "$log_file" "$status_file" "$since_commit" &
+  review_pr_bg "$pr_number" "$pr_repo" "$log_file" "$status_file" "$since_commit" "$head_oid" &
   pid=$!
   CHILD_PIDS+=("$pid")
   pid_info[$pid]="${pr_number}"$'\t'"${pr_title}"$'\t'"${pr_author}"$'\t'"${needs_rereview}"$'\t'"${log_file}"$'\t'"${status_file}"$'\t'"${pr_repo}"
@@ -1055,6 +1104,9 @@ while [[ $completed -lt $total ]]; do
     LOCKED:*)
       echo -e "${prefix} ${YELLOW}Skipped${RESET} ${suffix} ${DIM}— already being reviewed${RESET}"
       skipped=$((skipped + 1)) ;;
+    HANDLED:*)
+      echo -e "${prefix} ${YELLOW}Skipped${RESET} ${suffix} ${DIM}— this exact head already passed automated review${RESET}"
+      skipped=$((skipped + 1)) ;;
     *)
       echo -e "${prefix} ${RED}Error${RESET} ${suffix} ${DIM}— see ${log_file}${RESET}"
       errored=$((errored + 1)) ;;
@@ -1077,7 +1129,7 @@ echo ""
 echo -e "${BOLD}Done${RESET} — ${reviewed} reviewed, ${errored} errored"
 echo -e "  ${GREEN}${approved} approved${RESET}  ${RED}${changes_requested} changes requested${RESET}"
 if [[ "$skipped" -gt 0 ]]; then
-  echo -e "  ${YELLOW}${skipped} skipped${RESET} ${DIM}— already being reviewed by another run${RESET}"
+  echo -e "  ${YELLOW}${skipped} skipped${RESET} ${DIM}— already reviewed or in progress${RESET}"
 fi
 if [[ "$manual_approval" -gt 0 ]]; then
   echo -e "  ${YELLOW}${manual_approval} awaiting your approval${RESET} ${DIM}— review posted, approval left to you${RESET}"

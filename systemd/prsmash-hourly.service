@@ -19,11 +19,9 @@ Environment=PRSMASH_MAX_CONCURRENT_RUNS=4
 Environment=PRSMASH_LOG_DIR=/home/tvd/.prsmash
 Environment=PATH=/home/tvd/.pi/agent/bin:/home/tvd/.local/bin:/home/tvd/.local/share/nvm/v24.15.0/bin:/usr/bin:/bin:/opt/google-cloud-cli/bin
 
-# pi only registers its anthropic-claude-code provider when these point at the
-# local cli-proxy-api; ~/.pi/agent/auth.json has no claude-code entry, so there
-# is no OAuth fallback. They are set in ~/.config/fish/fish_variables, which the
-# systemd user manager never reads, so without them every review dies in seconds
-# on `Model "anthropic-claude-code/claude-opus-5" not found`.
+# Keep the anthropic-claude-code provider available for explicit model
+# overrides. These values live in fish's config, which the systemd user manager
+# never reads, and ~/.pi/agent/auth.json has no claude-code OAuth fallback.
 Environment=PI_CLAUDE_CODE_API_KEY_FILE=/home/tvd/.cli-proxy-api/proxy.key
 Environment=PI_CLAUDE_CODE_BASE_URL=http://127.0.0.1:8317
 
