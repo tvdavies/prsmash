@@ -13,7 +13,8 @@ prsmash — automated PR review queue
 
 Run logs: ~/.prsmash/runs/20260703-103000-2066728
 Source repo: ~/dev/acme/web
-Auto-approve authors: bob,dave
+Trusted authors: bob,dave
+Human approval: untrusted authors with 1001+ changed lines
 
 Fetching review queue...
 Found 4 PRs in acme/web
@@ -60,28 +61,37 @@ Reviews are guarded by locks: one global lock per machine (concurrent
 runs exit early) and one lock per PR (a PR already being reviewed by
 another run is skipped, not double-reviewed).
 
-## Trusted authors
+## Human approval policy
 
-Not every PR should be rubber-stamped by an agent, so approval is
-gated on who wrote the PR. `PRSMASH_TRUSTED_AUTHORS` (default
-`jaythegeek,corixdean,gsasu,beddial`) is a comma or space separated
-list of GitHub logins, matched case-insensitively:
+Automatic approval is held back only when both of these conditions are true:
 
-- **On the list** — the review is submitted as a real GitHub
-  **approval**, exactly as before.
-- **Not on the list** — the identical review is posted as a
-  **comment**, carrying its `Approved` verdict plus a banner
-  explaining that a human makes the approval call. The run reports
-  **"Review posted, awaiting your approval"** and sends you a Slack DM
-  with the PR link.
+1. The PR author is not in `PRSMASH_TRUSTED_AUTHORS` (default
+   `jaythegeek,corixdean,gsasu,beddial`). Logins are comma or space separated and
+   matched case-insensitively.
+2. Additions + deletions are at least `PRSMASH_APPROVAL_LINE_LIMIT` (default
+   `1001`, meaning the PR changes more than 1,000 lines). The legacy
+   `PRSMASH_APPROVAL_MAX_LINES` name remains a fallback when the primary variable
+   is unset.
 
-Set the list to an empty string to turn the gate off and approve every
-eligible PR.
+| Author | Changed lines | Result |
+| --- | ---: | --- |
+| Trusted | Any size | GitHub approval |
+| Untrusted | 1,000 or fewer | GitHub approval |
+| Untrusted | 1,001 or more | Review comment awaiting human approval |
 
-Only the approval is gated. `REQUEST_CHANGES` and plain comment
-reviews are posted normally whoever the author is, and the gate never
-turns a pass into a fail — an ungated PR gets the same verdict, just
-without the green tick.
+The held review still carries its `Approved` verdict, but is posted as a comment
+with a generic human-approval banner. The run reports **"Review posted, awaiting
+your approval"** and sends you a Slack DM with the PR link.
+
+Set `PRSMASH_AUTO_APPROVE_ALL=true` to bypass both checks and approve every
+eligible PR regardless of author or size. The value accepts `true` or `false`
+case-insensitively; any other non-empty value fails rather than silently changing
+the policy. Setting `PRSMASH_TRUSTED_AUTHORS` to an empty string remains a
+compatible way to disable the gate and approve every eligible PR.
+
+Only an approval verdict is gated. `REQUEST_CHANGES` and plain comment reviews
+are posted normally regardless of author, size, or the override; the policy
+never turns a passing review into a failing one.
 
 Reviews posted as issue comments, including manual-gated reviews, are
 deduplicated per PR head SHA. Once an exact head has passed automated review,
@@ -126,14 +136,10 @@ a 👍 is treated as a 👎, so changing your mind fails safe. Unanswered
 approvals are dropped after `PRSMASH_APPROVAL_PENDING_TTL_DAYS`
 (default 14).
 
-The list is passed to the skill as `PRSMASH_TRUSTED_AUTHORS`; the
-skill signals a downgrade back by printing
+The trusted-author list and changed-line limit are passed to the skill together.
+When both conditions require human sign-off, the skill reports
 `PRSMASH_MANUAL_APPROVAL_REQUIRED=true` and
-`PRSMASH_MANUAL_APPROVAL_REASON_CODE=untrusted-author`.
-
-`PRSMASH_APPROVAL_LINE_LIMIT` is a second, independent downgrade rule
-supported by the skill (reason code `approval-line-limit`). `prsmash`
-deliberately leaves it unset, so size alone never blocks an approval.
+`PRSMASH_MANUAL_APPROVAL_REASON_CODE=untrusted-author-over-line-limit`.
 
 ## Prerequisites
 
@@ -144,7 +150,7 @@ deliberately leaves it unset, so size alone never blocks an approval.
 - Optional, for Slack notifications and reaction approvals: a `slack.sh`
   helper supporting `resolve`, `send`, `profile` and `reactions`, plus
   `SLACK_MCP_XOXC_TOKEN` / `SLACK_MCP_XOXD_TOKEN` in the environment.
-  Without it, reviews for untrusted authors are still posted as
+  Without it, large reviews for untrusted authors are still posted as
   comments — you just have to approve them on GitHub yourself.
 
 ## Install
@@ -163,7 +169,10 @@ Then point it at your setup (env vars, with these defaults):
 | `PR_REVIEW_SKILL_DIR` | `~/agent-skills/skills/pr-review` | The pi `pr-review` skill directory |
 | `PRSMASH_QUEUE_SCRIPT` | `~/.claude/skills/review-queue/scripts/review-queue.sh` | Queue script (a copy lives in `lib/review-queue.sh`) |
 | `PI_PRSMASH_MODEL` | `openai-codex/gpt-5.6-sol` | Model passed to `pi --model` |
-| `PRSMASH_TRUSTED_AUTHORS` | `jaythegeek,corixdean,gsasu,beddial` | Authors whose PRs may be approved automatically (empty disables the gate) |
+| `PRSMASH_TRUSTED_AUTHORS` | `jaythegeek,corixdean,gsasu,beddial` | Authors whose large PRs may be approved automatically (empty disables the gate) |
+| `PRSMASH_APPROVAL_LINE_LIMIT` | `1001` | First changed-line count that requires an untrusted author to get human approval |
+| `PRSMASH_APPROVAL_MAX_LINES` | _(unset)_ | Legacy fallback name for `PRSMASH_APPROVAL_LINE_LIMIT` |
+| `PRSMASH_AUTO_APPROVE_ALL` | `false` | Set to `true` to bypass author and size gating for every eligible PR |
 | `PI_PRSMASH_THINKING` | `high` | Reasoning level passed to `pi --thinking` |
 | `PRSMASH_REVIEW_TIMEOUT` | `2700` | Seconds before a single review is killed (p99 is ~32m) |
 | `PRSMASH_LOG_DIR` | `~/.prsmash` | Locks, run logs, notification markers |
@@ -188,10 +197,12 @@ prsmash --dry-run
 prsmash                          # pick PRs via fzf, review selected in parallel
 prsmash --all                    # review everything in the queue, no prompt
 prsmash --dry-run                # list what would be reviewed and exit
-prsmash --include-implicit      # also surface implicit re-review candidates (manual mode)
-prsmash --trusted-authors alice,bob  # override who may be approved automatically
+prsmash --include-implicit           # also surface implicit re-review candidates (manual mode)
+prsmash --trusted-authors alice,bob  # override who is trusted for large PRs
 prsmash --trusted-authors ''         # approve every eligible PR (no author gate)
-prsmash --model <provider/model>   # override the pi model
+prsmash --approval-line-limit 2001  # require human approval above 2,000 changed lines
+PRSMASH_AUTO_APPROVE_ALL=true prsmash --all  # bypass approval gating
+prsmash --model <provider/model>     # override the pi model
 ```
 
 ### Re-reviews

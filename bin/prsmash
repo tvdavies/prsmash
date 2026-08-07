@@ -8,11 +8,11 @@
 #   prsmash --dry-run    # show what would be reviewed
 #   prsmash --include-implicit  # include implicit re-review candidates in manual mode
 #   prsmash --model openai-codex/gpt-5.6-sol --thinking high
-#   prsmash --trusted-authors alice,bob   # only auto-approve these authors ('' disables gating)
+#   prsmash --trusted-authors alice,bob   # configure authors trusted for large PRs
 #
-# PRs by authors outside the trusted list get their review posted as a comment
-# plus a Slack DM. Reacting to that DM approves (or drops) the PR on the next
-# run — see "Approving from Slack" in the README.
+# Large PRs by authors outside the trusted list get their review posted as a
+# comment plus a Slack DM. Reacting to that DM approves (or drops) the PR on the
+# next run — see "Approving from Slack" in the README.
 #
 set -eo pipefail
 
@@ -26,10 +26,11 @@ PRSMASH_SOURCE_REPO="${PRSMASH_SOURCE_REPO:-$HOME/dev/lleverage-ai/lleverage}"
 SLACK_SCRIPT="${PRSMASH_SLACK_SCRIPT:-$HOME/.claude/skills/slack/scripts/slack.sh}"
 SLACK_APPROVAL_NOTIFY="${PRSMASH_SLACK_APPROVAL_NOTIFY:-true}"
 SLACK_APPROVAL_TARGET="${PRSMASH_SLACK_APPROVAL_TARGET:-@tom}"
-# Authors whose PRs we are happy to have approved without a human looking. Every
-# other author still gets the full review posted, but as a comment only, plus a
-# Slack DM asking for the final approval call.
+# Authors whose large PRs we are happy to have approved without a human looking.
+# Untrusted authors only need human sign-off when the changed-line limit is met.
 TRUSTED_AUTHORS="${PRSMASH_TRUSTED_AUTHORS-jaythegeek,corixdean,gsasu,beddial}"
+APPROVAL_LINE_LIMIT="${PRSMASH_APPROVAL_LINE_LIMIT:-${PRSMASH_APPROVAL_MAX_LINES:-1001}}"
+AUTO_APPROVE_ALL="${PRSMASH_AUTO_APPROVE_ALL:-false}"
 # Reaction-driven approval. A PR held back for a human gets a DM; reacting to
 # that DM approves or drops it, and the next run picks the reaction up. The
 # first emoji in each list is the one the DM tells you to use.
@@ -66,13 +67,26 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN=true; shift ;;
     --all|--no-select) SKIP_SELECT=true; shift ;;
     --include-implicit) INCLUDE_IMPLICIT=true; shift ;;
-    --approval-line-limit) [[ -n "${2:-}" ]] || { echo "--approval-line-limit requires a value" >&2; exit 1; }; echo "Warning: --approval-line-limit is ignored; prsmash now approves eligible PRs regardless of size." >&2; shift 2 ;;
+    --approval-line-limit) APPROVAL_LINE_LIMIT="${2:-}"; [[ -n "$APPROVAL_LINE_LIMIT" ]] || { echo "--approval-line-limit requires a value" >&2; exit 1; }; shift 2 ;;
     --trusted-authors) TRUSTED_AUTHORS="${2-}"; [[ $# -ge 2 ]] || { echo "--trusted-authors requires a value" >&2; exit 1; }; shift 2 ;;
     --model) MODEL="${2:-}"; [[ -n "$MODEL" ]] || { echo "--model requires a value" >&2; exit 1; }; shift 2 ;;
     --thinking) THINKING_LEVEL="${2:-}"; [[ -n "$THINKING_LEVEL" ]] || { echo "--thinking requires a value" >&2; exit 1; }; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
+
+AUTO_APPROVE_ALL=$(printf '%s' "$AUTO_APPROVE_ALL" | tr '[:upper:]' '[:lower:]')
+case "$AUTO_APPROVE_ALL" in
+  true|false) ;;
+  *) echo "PRSMASH_AUTO_APPROVE_ALL must be true or false." >&2; exit 1 ;;
+esac
+
+if [[ "$AUTO_APPROVE_ALL" != true ]]; then
+  if ! [[ "$APPROVAL_LINE_LIMIT" =~ ^[0-9]+$ ]] || [[ "$APPROVAL_LINE_LIMIT" -le 0 ]]; then
+    echo "PRSMASH_APPROVAL_LINE_LIMIT must be a positive integer." >&2
+    exit 1
+  fi
+fi
 
 # --- Locks and logs ---
 LOG_ROOT="${PRSMASH_LOG_DIR:-$HOME/.prsmash}"
@@ -255,10 +269,13 @@ echo -e "${DIM}Run logs: ${RUN_DIR}${RESET}"
 echo -e "${DIM}Source repo: ${PRSMASH_SOURCE_REPO}${RESET}"
 echo -e "${DIM}Model: ${MODEL}${RESET}"
 echo -e "${DIM}Thinking: ${THINKING_LEVEL}${RESET}"
-if [[ -n "${TRUSTED_AUTHORS//[[:space:],;]/}" ]]; then
-  echo -e "${DIM}Auto-approve authors: ${TRUSTED_AUTHORS}${RESET}"
+if [[ "$AUTO_APPROVE_ALL" == true ]]; then
+  echo -e "${YELLOW}Approval policy: override enabled — every eligible PR will be approved${RESET}"
+elif [[ -n "${TRUSTED_AUTHORS//[[:space:],;]/}" ]]; then
+  echo -e "${DIM}Trusted authors: ${TRUSTED_AUTHORS}${RESET}"
+  echo -e "${DIM}Human approval: untrusted authors with ${APPROVAL_LINE_LIMIT}+ changed lines${RESET}"
 else
-  echo -e "${YELLOW}Auto-approve authors: (none set — every eligible PR will be approved)${RESET}"
+  echo -e "${YELLOW}Approval policy: no trusted-author list — every eligible PR will be approved${RESET}"
 fi
 echo -e "${DIM}Approval Slack DM target: ${SLACK_APPROVAL_TARGET}${RESET}"
 echo ""
@@ -904,7 +921,7 @@ run_pr_review() {
   fi
 
   local rc=0
-  (cd "$worktree_dir" && TMPDIR="$tmp_dir" PR_REVIEW_TMPDIR="$tmp_dir" PRSMASH_REVIEW_RESULT_FILE="$result_file" PRSMASH_REVIEW_EXPECTED_HEAD="$analyzed_head" PRSMASH_APPROVAL_LINE_LIMIT= PRSMASH_APPROVAL_MAX_LINES= PRSMASH_TRUSTED_AUTHORS="$TRUSTED_AUTHORS" "${runner[@]}") || rc=$?
+  (cd "$worktree_dir" && TMPDIR="$tmp_dir" PR_REVIEW_TMPDIR="$tmp_dir" PRSMASH_REVIEW_RESULT_FILE="$result_file" PRSMASH_REVIEW_EXPECTED_HEAD="$analyzed_head" PRSMASH_APPROVAL_LINE_LIMIT="$APPROVAL_LINE_LIMIT" PRSMASH_TRUSTED_AUTHORS="$TRUSTED_AUTHORS" PRSMASH_AUTO_APPROVE_ALL="$AUTO_APPROVE_ALL" "${runner[@]}") || rc=$?
   if [[ $rc -eq 124 || $rc -eq 137 ]]; then
     echo "PRSMASH_REVIEW_TIMEOUT: killed after ${REVIEW_TIMEOUT}s"
   fi
