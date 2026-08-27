@@ -60,7 +60,16 @@ RESET='\033[0m'
 DRY_RUN=false
 SKIP_SELECT=false
 INCLUDE_IMPLICIT=false
-MODEL="${PI_PRSMASH_MODEL:-openai-codex/gpt-5.6-sol}"
+# Default model resolution: --model flag > PI_PRSMASH_MODEL env > the model
+# file written by prsmash-model > built-in default. The file lets the default
+# be switched without editing this script or the systemd units.
+MODEL_FILE="${PRSMASH_MODEL_FILE:-${PRSMASH_LOG_DIR:-$HOME/.prsmash}/model}"
+DEFAULT_MODEL="anthropic-claude-code/claude-opus-4-8"
+if [[ -f "$MODEL_FILE" ]]; then
+  saved_model=$(head -n1 "$MODEL_FILE" 2>/dev/null | tr -d '[:space:]')
+  [[ -n "$saved_model" ]] && DEFAULT_MODEL="$saved_model"
+fi
+MODEL="${PI_PRSMASH_MODEL:-$DEFAULT_MODEL}"
 THINKING_LEVEL="${PI_PRSMASH_THINKING:-high}"
 while [[ $# -gt 0 ]]; do
   case "$1" in

@@ -159,6 +159,7 @@ When both conditions require human sign-off, the skill reports
 git clone https://github.com/tvdavies/prsmash.git ~/src/prsmash
 mkdir -p ~/.local/bin
 ln -sf ~/src/prsmash/bin/prsmash ~/.local/bin/prsmash
+ln -sf ~/src/prsmash/bin/prsmash-model ~/.local/bin/prsmash-model
 ```
 
 Then point it at your setup (env vars, with these defaults):
@@ -168,7 +169,8 @@ Then point it at your setup (env vars, with these defaults):
 | `PRSMASH_SOURCE_REPO` | `~/dev/lleverage-ai/lleverage` | Local clone of the repo whose PRs you review |
 | `PR_REVIEW_SKILL_DIR` | `~/agent-skills/skills/pr-review` | The pi `pr-review` skill directory |
 | `PRSMASH_QUEUE_SCRIPT` | `~/.claude/skills/review-queue/scripts/review-queue.sh` | Queue script (a copy lives in `lib/review-queue.sh`) |
-| `PI_PRSMASH_MODEL` | `openai-codex/gpt-5.6-sol` | Model passed to `pi --model` |
+| `PI_PRSMASH_MODEL` | _(unset)_ | Model passed to `pi --model`; overrides the saved model file |
+| `PRSMASH_MODEL_FILE` | `~/.prsmash/model` | One-line file holding the default model, managed by `prsmash-model` |
 | `PRSMASH_TRUSTED_AUTHORS` | `jaythegeek,corixdean,gsasu,beddial` | Authors whose large PRs may be approved automatically (empty disables the gate) |
 | `PRSMASH_APPROVAL_LINE_LIMIT` | `1001` | First changed-line count that requires an untrusted author to get human approval |
 | `PRSMASH_APPROVAL_MAX_LINES` | _(unset)_ | Legacy fallback name for `PRSMASH_APPROVAL_LINE_LIMIT` |
@@ -202,8 +204,25 @@ prsmash --trusted-authors alice,bob  # override who is trusted for large PRs
 prsmash --trusted-authors ''         # approve every eligible PR (no author gate)
 prsmash --approval-line-limit 2001  # require human approval above 2,000 changed lines
 PRSMASH_AUTO_APPROVE_ALL=true prsmash --all  # bypass approval gating
-prsmash --model <provider/model>     # override the pi model
+prsmash --model <provider/model>     # override the pi model for this run only
 ```
+
+### Changing the default model
+
+`prsmash-model` manages the persistent default, picked from the models pi
+actually knows about:
+
+```bash
+prsmash-model                    # pick interactively (fzf) from pi --list-models
+prsmash-model <provider/model>   # set directly (validated against pi's registry)
+prsmash-model --show             # effective default and where it comes from
+prsmash-model --list             # valid provider/model ids
+prsmash-model --clear            # back to the built-in default
+```
+
+The choice is saved to `~/.prsmash/model` and read by every run, including the
+scheduled systemd runs. Precedence: `--model` flag > `PI_PRSMASH_MODEL` env >
+model file > built-in default (`anthropic-claude-code/claude-opus-4-8`).
 
 ### Re-reviews
 

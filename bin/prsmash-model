@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+#
+# prsmash-model — view or change the default model prsmash uses for reviews.
+#
+# Usage:
+#   prsmash-model                    # pick a model interactively (fzf) from pi's registry
+#   prsmash-model <provider/model>   # set the default model directly (validated)
+#   prsmash-model --show             # show the effective default and where it comes from
+#   prsmash-model --list             # list valid provider/model ids
+#   prsmash-model --clear            # remove the saved choice (back to the built-in default)
+#
+# The choice is stored in a one-line file (default: ~/.prsmash/model) that
+# prsmash reads on every run — manual and scheduled alike. Precedence in
+# prsmash: --model flag > PI_PRSMASH_MODEL env > this file > built-in default.
+set -eo pipefail
+
+BUILTIN_DEFAULT="anthropic-claude-code/claude-opus-4-8"
+CONFIG_DIR="${PRSMASH_LOG_DIR:-$HOME/.prsmash}"
+MODEL_FILE="${PRSMASH_MODEL_FILE:-$CONFIG_DIR/model}"
+
+die() { echo "$*" >&2; exit 1; }
+
+usage() {
+  sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# pi's model table without its header row. Fails loudly when pi is missing so a
+# broken PATH cannot silently produce an empty picker.
+model_table() {
+  command -v pi >/dev/null 2>&1 || die "pi is not on PATH; cannot list models."
+  pi --list-models 2>/dev/null | awk 'NR > 1 && NF >= 2'
+}
+
+valid_models() {
+  model_table | awk '{print $1 "/" $2}'
+}
+
+saved_model() {
+  [[ -f "$MODEL_FILE" ]] || return 1
+  local m
+  m=$(head -n1 "$MODEL_FILE" | tr -d '[:space:]')
+  [[ -n "$m" ]] || return 1
+  printf '%s\n' "$m"
+}
+
+show() {
+  local saved
+  saved=$(saved_model || true)
+  if [[ -n "${PI_PRSMASH_MODEL:-}" ]]; then
+    echo "Effective default: ${PI_PRSMASH_MODEL} (from PI_PRSMASH_MODEL in the environment)"
+    [[ -n "$saved" ]] && echo "Saved in ${MODEL_FILE}: ${saved} (shadowed by the environment)"
+  elif [[ -n "$saved" ]]; then
+    echo "Effective default: ${saved} (from ${MODEL_FILE})"
+  else
+    echo "Effective default: ${BUILTIN_DEFAULT} (built-in; no ${MODEL_FILE})"
+  fi
+  if [[ -n "$saved" ]] && ! valid_models | grep -Fxq -- "$saved"; then
+    echo "Warning: ${saved} is not in pi's current model list; prsmash runs will fail until it is changed." >&2
+  fi
+}
+
+set_model() {
+  local model=$1 tmp
+  valid_models | grep -Fxq -- "$model" \
+    || die "Not a valid pi model: ${model}
+Run 'prsmash-model --list' to see valid provider/model ids."
+  mkdir -p "$(dirname "$MODEL_FILE")"
+  tmp=$(mktemp "$(dirname "$MODEL_FILE")/.model.tmp.XXXXXX")
+  printf '%s\n' "$model" > "$tmp"
+  mv "$tmp" "$MODEL_FILE"
+  echo "prsmash default model set to ${model} (${MODEL_FILE})"
+  if [[ -n "${PI_PRSMASH_MODEL:-}" ]]; then
+    echo "Note: PI_PRSMASH_MODEL=${PI_PRSMASH_MODEL} is set in this environment and overrides the file." >&2
+  fi
+}
+
+clear_model() {
+  if [[ -f "$MODEL_FILE" ]]; then
+    rm -f "$MODEL_FILE"
+    echo "Removed ${MODEL_FILE}; prsmash falls back to the built-in default (${BUILTIN_DEFAULT})."
+  else
+    echo "Nothing saved (${MODEL_FILE} does not exist); the built-in default (${BUILTIN_DEFAULT}) applies."
+  fi
+}
+
+pick_model() {
+  command -v fzf >/dev/null 2>&1 \
+    || die "fzf is required for interactive selection. Alternatively: prsmash-model <provider/model>"
+  local current table header selection model
+  current=$(saved_model || printf '%s' "$BUILTIN_DEFAULT")
+  table=$(model_table)
+  [[ -n "$table" ]] || die "pi --list-models returned no models."
+  header=$(pi --list-models 2>/dev/null | head -n1)
+  selection=$(printf '%s\n' "$table" | fzf \
+    --header="current default: ${current}"$'\n'"${header}" \
+    --height=80% \
+    --reverse \
+    --prompt='model> ' || true)
+  if [[ -z "$selection" ]]; then
+    echo "No model selected; default unchanged."
+    exit 0
+  fi
+  model=$(awk '{print $1 "/" $2}' <<<"$selection")
+  set_model "$model"
+}
+
+case "${1:-}" in
+  "") pick_model ;;
+  --show) show ;;
+  --list) valid_models ;;
+  --clear) clear_model ;;
+  --help|-h) usage ;;
+  --*) die "Unknown argument: $1" ;;
+  *)
+    [[ $# -eq 1 ]] || die "Expected a single provider/model argument."
+    set_model "$1" ;;
+esac
