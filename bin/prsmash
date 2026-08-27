@@ -17,7 +17,7 @@
 set -eo pipefail
 
 QUEUE_SCRIPT="${PRSMASH_QUEUE_SCRIPT:-$HOME/.claude/skills/review-queue/scripts/review-queue.sh}"
-PR_REVIEW_SKILL_DIR="${PR_REVIEW_SKILL_DIR:-$HOME/agent-skills/skills/pr-review}"
+PR_REVIEW_SKILL_DIR="${PR_REVIEW_SKILL_DIR:-$HOME/agent-skills/skills/general/pr-review}"
 PRSMASH_SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}")
 PRSMASH_LIB_DIR="${PRSMASH_LIB_DIR:-$(dirname "$PRSMASH_SCRIPT_PATH")/../lib}"
 # shellcheck source=../lib/review-disposition-state.sh

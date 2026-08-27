@@ -167,7 +167,7 @@ Then point it at your setup (env vars, with these defaults):
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `PRSMASH_SOURCE_REPO` | `~/dev/lleverage-ai/lleverage` | Local clone of the repo whose PRs you review |
-| `PR_REVIEW_SKILL_DIR` | `~/agent-skills/skills/pr-review` | The pi `pr-review` skill directory |
+| `PR_REVIEW_SKILL_DIR` | `~/agent-skills/skills/general/pr-review` | The pi `pr-review` skill directory |
 | `PRSMASH_QUEUE_SCRIPT` | `~/.claude/skills/review-queue/scripts/review-queue.sh` | Queue script (a copy lives in `lib/review-queue.sh`) |
 | `PI_PRSMASH_MODEL` | _(unset)_ | Model passed to `pi --model`; overrides the saved model file |
 | `PRSMASH_MODEL_FILE` | `~/.prsmash/model` | One-line file holding the default model, managed by `prsmash-model` |
