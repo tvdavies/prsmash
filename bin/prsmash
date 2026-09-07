@@ -142,6 +142,19 @@ RUN_DIR="$LOG_ROOT/runs/$RUN_ID"
 mkdir -p "$RUN_DIR"
 ln -sfn "$RUN_DIR" "$LOG_ROOT/latest"
 
+# --- Run-directory retention ---
+# Scheduled every-5-minutes runs accumulate fast (16k+ dirs were once found
+# here). Prune run dirs older than the retention window, politely (idle IO
+# class) and in the background so it never delays a review tick.
+RUN_RETENTION_DAYS="${PRSMASH_RUN_RETENTION_DAYS:-7}"
+if [[ "$RUN_RETENTION_DAYS" =~ ^[0-9]+$ && "$RUN_RETENTION_DAYS" -gt 0 ]]; then
+  (
+    find "$LOG_ROOT/runs" -mindepth 1 -maxdepth 1 -type d -mtime "+${RUN_RETENTION_DAYS}" -print0 2>/dev/null \
+      | ionice -c3 xargs -0 -r rm -rf 2>/dev/null
+  ) &
+  disown $! 2>/dev/null || true
+fi
+
 exec > >(tee -a "$RUN_DIR/prsmash.log") 2>&1
 
 CHILD_PIDS=()
