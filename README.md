@@ -98,6 +98,36 @@ deduplicated per PR head SHA. Once an exact head has passed automated review,
 scheduled runs skip it rather than repeatedly reviewing code GitHub still shows
 as review-requested. A pushed commit has a new SHA and is reviewed normally.
 
+## Push notifications (ntfy)
+
+Every action taken on a PR is published to an [ntfy.sh](https://ntfy.sh)
+topic (`prsmash` by default), so outcomes arrive as phone push
+notifications — subscribe to the topic in the ntfy app:
+
+| Outcome | Priority | Tag |
+| --- | --- | --- |
+| Approved | default | ✅ |
+| Commented | default | 💬 |
+| Changes requested | high | ⚠️ |
+| Awaiting your approval | high | 👀 |
+| Review failed | **urgent** (max) | 🚨 |
+
+Each notification links to the PR (tap to open). Skips (`LOCKED`,
+`HANDLED`) are silent — nothing was done to the PR. A run that dies
+before reviewing (invalid queue response) also publishes an urgent
+failure.
+
+Failures are rate limited to one notification per PR per
+`PRSMASH_NTFY_FAILURE_COOLDOWN_MINS` (default 60): a systemic outage
+errors every PR on every 5-minute tick, which would otherwise be
+thousands of urgent pushes. Successes are never rate limited.
+
+Note: public ntfy.sh topics are readable by anyone who guesses the
+name, and notifications include PR titles. Set `PRSMASH_NTFY_TOPIC` to
+something unguessable (or `PRSMASH_NTFY_SERVER` to a self-hosted ntfy)
+if that matters to you. `PRSMASH_NTFY_NOTIFY=false` disables the
+feature entirely.
+
 ## Approving from Slack
 
 React to that DM and the next run applies your decision — 👍 approves
@@ -143,7 +173,7 @@ When both conditions require human sign-off, the skill reports
 
 ## Prerequisites
 
-- `bash`, `jq`, `fzf`, `flock`, `git`
+- `bash`, `jq`, `fzf`, `flock`, `git`, `curl` (for ntfy notifications)
 - [`gh` CLI](https://cli.github.com/) authenticated (`gh auth status`)
 - [pi](https://github.com/earendil-works/pi-coding-agent) on PATH
 - A `pr-review` skill that accepts `--headless --pr <N>`
@@ -186,6 +216,10 @@ Then point it at your setup (env vars, with these defaults):
 | `PRSMASH_APPROVE_REACTIONS` | `+1,thumbsup,white_check_mark,heavy_check_mark` | Reactions that approve (first is the one the DM suggests) |
 | `PRSMASH_REJECT_REACTIONS` | `-1,thumbsdown,x,no_entry_sign` | Reactions that drop the approval |
 | `PRSMASH_APPROVAL_PENDING_TTL_DAYS` | `14` | Days before an unanswered approval is dropped |
+| `PRSMASH_NTFY_NOTIFY` | `true` | Toggle ntfy push notifications |
+| `PRSMASH_NTFY_SERVER` | `https://ntfy.sh` | ntfy server to publish to |
+| `PRSMASH_NTFY_TOPIC` | `prsmash` | ntfy topic for review outcome notifications |
+| `PRSMASH_NTFY_FAILURE_COOLDOWN_MINS` | `60` | Minimum minutes between failure notifications for the same PR |
 
 Confirm with:
 

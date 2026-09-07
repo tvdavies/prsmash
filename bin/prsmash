@@ -46,6 +46,17 @@ APPROVAL_ACTOR="${PRSMASH_SLACK_APPROVAL_USER:-}"
 # subsequent timer firing. p99 review duration is ~32m, so 45m only cuts runs
 # that are already pathological.
 REVIEW_TIMEOUT="${PRSMASH_REVIEW_TIMEOUT:-2700}"
+# ntfy.sh push notifications. Every action taken on a PR (approve, request
+# changes, comment, review held for human approval) publishes to the topic;
+# failures publish at ntfy's most urgent priority so they cut through on a
+# phone. Set PRSMASH_NTFY_NOTIFY=false to disable.
+NTFY_NOTIFY="${PRSMASH_NTFY_NOTIFY:-true}"
+NTFY_SERVER="${PRSMASH_NTFY_SERVER:-https://ntfy.sh}"
+NTFY_TOPIC="${PRSMASH_NTFY_TOPIC:-prsmash}"
+# A broken run errors every PR on every 5-minute tick, so a day-long outage
+# would otherwise be thousands of urgent pushes. Failures re-notify at most
+# once per PR per this many minutes; successes are never rate limited.
+NTFY_FAILURE_COOLDOWN_MINS="${PRSMASH_NTFY_FAILURE_COOLDOWN_MINS:-60}"
 
 # --- Colours ---
 BOLD='\033[1m'
@@ -332,6 +343,76 @@ slack_available() {
   [[ -x "$SLACK_SCRIPT" ]] || { echo -e "${DIM}Slack ${what} skipped: ${SLACK_SCRIPT} not executable${RESET}"; return 1; }
   [[ -n "${SLACK_MCP_XOXC_TOKEN:-}" && -n "${SLACK_MCP_XOXD_TOKEN:-}" ]] || { echo -e "${DIM}Slack ${what} skipped: Slack tokens not in environment${RESET}"; return 1; }
   return 0
+}
+
+# Publish one message to the ntfy topic. Never fatal: a phone notification is
+# not worth failing a review over, so callers can rely on this returning
+# non-zero quietly when curl is missing or the server is unreachable.
+ntfy_publish() {
+  local title=$1 priority=$2 tags=$3 body=$4 click=$5
+
+  [[ "$NTFY_NOTIFY" == "true" ]] || return 0
+  command -v curl >/dev/null 2>&1 || { echo -e "${DIM}ntfy notification skipped: curl not available${RESET}"; return 0; }
+
+  local curl_args=(-H "Title: ${title}" -H "Priority: ${priority}" -H "Tags: ${tags}")
+  [[ -n "$click" ]] && curl_args+=(-H "Click: ${click}")
+
+  curl -fsS --max-time 10 "${curl_args[@]}" -d "$body" \
+    "${NTFY_SERVER%/}/${NTFY_TOPIC}" >/dev/null 2>&1
+}
+
+# Push the outcome of one PR review. Failures carry ntfy's highest priority
+# (urgent) and are deduplicated per PR within NTFY_FAILURE_COOLDOWN_MINS so a
+# systemic outage does not hammer the phone every tick.
+notify_pr_ntfy() {
+  local kind=$1 pr_number=$2 pr_repo=$3 pr_title=$4 pr_author=$5 time_str=$6
+  local title priority tags body pr_url marker_file safe_key
+
+  [[ "$NTFY_NOTIFY" == "true" ]] || return 0
+
+  case "$kind" in
+    approved)
+      title="Approved #${pr_number}"
+      priority=default; tags=white_check_mark ;;
+    changes-requested)
+      title="Changes requested on #${pr_number}"
+      priority=high; tags=warning ;;
+    commented)
+      title="Commented on #${pr_number}"
+      priority=default; tags=speech_balloon ;;
+    awaiting-approval)
+      title="Needs your approval: #${pr_number}"
+      priority=high; tags=eyes ;;
+    failed)
+      title="Review FAILED for #${pr_number}"
+      priority=urgent; tags=rotating_light ;;
+    *) return 0 ;;
+  esac
+
+  if [[ "$kind" == "failed" ]] \
+      && [[ "$NTFY_FAILURE_COOLDOWN_MINS" =~ ^[0-9]+$ ]] && [[ "$NTFY_FAILURE_COOLDOWN_MINS" -gt 0 ]]; then
+    safe_key=$(printf 'fail-%s-%s' "$pr_repo" "$pr_number" | tr '/:' '__')
+    marker_file="$LOG_ROOT/ntfy-notifications/${safe_key}"
+    mkdir -p "$LOG_ROOT/ntfy-notifications"
+    if [[ -f "$marker_file" ]] && [[ -n "$(find "$marker_file" -mmin "-${NTFY_FAILURE_COOLDOWN_MINS}" 2>/dev/null)" ]]; then
+      echo -e "${DIM}ntfy failure notification for #${pr_number} suppressed (cooldown)${RESET}"
+      return 0
+    fi
+  fi
+
+  pr_url="https://github.com/${pr_repo}/pull/${pr_number}"
+  if [[ "$kind" == "failed" ]]; then
+    body=$(printf '%s (%s) — review errored after %s' "$pr_title" "$pr_author" "$time_str")
+  else
+    body=$(printf '%s (%s) — %s' "$pr_title" "$pr_author" "$time_str")
+  fi
+
+  if ntfy_publish "$title" "$priority" "$tags" "$body" "$pr_url"; then
+    [[ -n "${marker_file:-}" ]] && date -Is > "$marker_file"
+    echo -e "${DIM}ntfy ${kind} notification sent for #${pr_number}${RESET}"
+  else
+    echo -e "${DIM}ntfy ${kind} notification failed for #${pr_number}${RESET}"
+  fi
 }
 
 # Our GitHub login. Approvals are checked before the queue fetch that sets
@@ -678,6 +759,8 @@ if ! jq -e 'type == "object" and (.prs | type == "array")' >/dev/null 2>&1 <<<"$
     exit 0
   fi
   echo "Queue script returned an invalid response; see $RUN_DIR/queue.json" >&2
+  ntfy_publish "prsmash run failed" urgent rotating_light \
+    "Queue script returned an invalid response; see $RUN_DIR/queue.json" "" || true
   exit 1
 fi
 
@@ -1113,19 +1196,23 @@ while [[ $completed -lt $total ]]; do
     OK:APPROVED)
       echo -e "${prefix} ${GREEN}Approved${RESET} ${suffix}"
       notify_approval_slack approved "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$log_file" || true
+      notify_pr_ntfy approved "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$time_str" || true
       approved=$((approved + 1))
       reviewed=$((reviewed + 1)) ;;
     OK:MANUAL_APPROVAL_REQUIRED)
       echo -e "${prefix} ${YELLOW}Review posted, awaiting your approval${RESET} ${suffix}"
       notify_approval_slack awaiting-approval "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$log_file" || true
+      notify_pr_ntfy awaiting-approval "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$time_str" || true
       manual_approval=$((manual_approval + 1))
       reviewed=$((reviewed + 1)) ;;
     OK:CHANGES_REQUESTED)
       echo -e "${prefix} ${RED}Changes requested${RESET} ${suffix}"
+      notify_pr_ntfy changes-requested "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$time_str" || true
       changes_requested=$((changes_requested + 1))
       reviewed=$((reviewed + 1)) ;;
     OK:*)
       echo -e "${prefix} ${BLUE}Commented${RESET} ${suffix}"
+      notify_pr_ntfy commented "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$time_str" || true
       reviewed=$((reviewed + 1)) ;;
     LOCKED:*)
       echo -e "${prefix} ${YELLOW}Skipped${RESET} ${suffix} ${DIM}— already being reviewed${RESET}"
@@ -1135,6 +1222,7 @@ while [[ $completed -lt $total ]]; do
       skipped=$((skipped + 1)) ;;
     *)
       echo -e "${prefix} ${RED}Error${RESET} ${suffix} ${DIM}— see ${log_file}${RESET}"
+      notify_pr_ntfy failed "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$time_str" || true
       errored=$((errored + 1)) ;;
   esac
 done
