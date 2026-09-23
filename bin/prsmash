@@ -999,12 +999,12 @@ run_pr_review() {
   # Incremental re-review: when we know the commit our last review looked at,
   # narrow the review to what changed since. Only valid if that commit is an
   # ancestor of the current head (a rebase/force-push invalidates it).
-  local skill_cmd="/skill:pr-review --headless --pr ${pr_number}"
+  local skill_cmd="/skill:pr-review --headless --post --pr ${pr_number}"
   if [[ -n "$since_commit" && "$since_commit" != "null" ]]; then
     if git -C "$worktree_dir" cat-file -e "$since_commit" 2>/dev/null \
        && git -C "$worktree_dir" merge-base --is-ancestor "$since_commit" HEAD 2>/dev/null \
        && [[ "$since_commit" != "$(git -C "$worktree_dir" rev-parse HEAD)" ]]; then
-      skill_cmd="/skill:pr-review --headless --pr ${pr_number} --since ${since_commit}"
+      skill_cmd="/skill:pr-review --headless --post --pr ${pr_number} --since ${since_commit}"
       echo "incrementalReviewSince=${since_commit}"
     else
       echo "incrementalReviewSince=invalid (${since_commit} not an ancestor of head; running full review)"
