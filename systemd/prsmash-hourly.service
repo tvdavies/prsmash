@@ -27,7 +27,8 @@ Environment=PI_CLAUDE_CODE_BASE_URL=http://127.0.0.1:8317
 
 # Slack approval DMs need the browser tokens, which otherwise only exist in
 # fish's config.fish (never read by the systemd user manager). They are secrets,
-# so they live in a 600-mode file outside this repo; the leading - makes a
+# so they live in a 600-mode file outside this repo (as does PRSMASH_NTFY_TOKEN
+# for the reserved ntfy topic); the leading - makes a
 # missing file non-fatal, in which case prsmash just logs that Slack is skipped.
 EnvironmentFile=-/home/tvd/.prsmash/slack.env
 
@@ -53,6 +54,7 @@ ExecStart=/bin/sh -c ' \
     --setenv=PI_CLAUDE_CODE_BASE_URL="$$PI_CLAUDE_CODE_BASE_URL" \
     --setenv=SLACK_MCP_XOXC_TOKEN="$$SLACK_MCP_XOXC_TOKEN" \
     --setenv=SLACK_MCP_XOXD_TOKEN="$$SLACK_MCP_XOXD_TOKEN" \
+    --setenv=PRSMASH_NTFY_TOKEN="$$PRSMASH_NTFY_TOKEN" \
     --setenv=PRSMASH_ALLOW_CONCURRENT=1 \
     --property=RuntimeMaxSec=3600 \
     /home/tvd/.local/bin/prsmash --all'

@@ -125,8 +125,10 @@ thousands of urgent pushes. Successes are never rate limited.
 Note: public ntfy.sh topics are readable by anyone who guesses the
 name, and notifications include PR titles. Set `PRSMASH_NTFY_TOPIC` to
 something unguessable (or `PRSMASH_NTFY_SERVER` to a self-hosted ntfy)
-if that matters to you. `PRSMASH_NTFY_NOTIFY=false` disables the
-feature entirely.
+if that matters to you. A topic reserved on your ntfy account needs
+`PRSMASH_NTFY_TOKEN` (an access token such as `tk_...`); without it
+ntfy.sh rejects every publish with 403. `PRSMASH_NTFY_NOTIFY=false`
+disables the feature entirely.
 
 ## Approving from Slack
 
@@ -219,6 +221,7 @@ Then point it at your setup (env vars, with these defaults):
 | `PRSMASH_NTFY_NOTIFY` | `true` | Toggle ntfy push notifications |
 | `PRSMASH_NTFY_SERVER` | `https://ntfy.sh` | ntfy server to publish to |
 | `PRSMASH_NTFY_TOPIC` | `prsmash` | ntfy topic for review outcome notifications |
+| `PRSMASH_NTFY_TOKEN` | _(unset)_ | ntfy access token, required when the topic is reserved |
 | `PRSMASH_NTFY_FAILURE_COOLDOWN_MINS` | `60` | Minimum minutes between failure notifications for the same PR |
 
 Confirm with:

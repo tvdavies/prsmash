@@ -53,6 +53,8 @@ REVIEW_TIMEOUT="${PRSMASH_REVIEW_TIMEOUT:-2700}"
 NTFY_NOTIFY="${PRSMASH_NTFY_NOTIFY:-true}"
 NTFY_SERVER="${PRSMASH_NTFY_SERVER:-https://ntfy.sh}"
 NTFY_TOPIC="${PRSMASH_NTFY_TOPIC:-prsmash}"
+# Access token for a reserved topic (ntfy.sh answers 403 without it).
+NTFY_TOKEN="${PRSMASH_NTFY_TOKEN:-}"
 # A broken run errors every PR on every 5-minute tick, so a day-long outage
 # would otherwise be thousands of urgent pushes. Failures re-notify at most
 # once per PR per this many minutes; successes are never rate limited.
@@ -369,6 +371,7 @@ ntfy_publish() {
 
   local curl_args=(-H "Title: ${title}" -H "Priority: ${priority}" -H "Tags: ${tags}")
   [[ -n "$click" ]] && curl_args+=(-H "Click: ${click}")
+  [[ -n "$NTFY_TOKEN" ]] && curl_args+=(-H "Authorization: Bearer ${NTFY_TOKEN}")
 
   curl -fsS --max-time 10 "${curl_args[@]}" -d "$body" \
     "${NTFY_SERVER%/}/${NTFY_TOPIC}" >/dev/null 2>&1
