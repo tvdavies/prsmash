@@ -66,7 +66,7 @@ another run is skipped, not double-reviewed).
 Automatic approval is held back only when both of these conditions are true:
 
 1. The PR author is not in `PRSMASH_TRUSTED_AUTHORS` (default
-   `jaythegeek,corixdean,gsasu,beddial`). Logins are comma or space separated and
+   `bastiaan-bit,bethandutton,bram-lleverage,corixdean,eddial,emile-naude,gsasu,jaythegeek,joostverdoorn,lkooy,lorenzofiumi91,marcuslleverage,matteo-chi,noahvrijn,tijmenvanetten,tomvanwees-wq,tvdavies`). Logins are comma or space separated and
    matched case-insensitively.
 2. Additions + deletions are at least `PRSMASH_APPROVAL_LINE_LIMIT` (default
    `1001`, meaning the PR changes more than 1,000 lines). The legacy
@@ -203,7 +203,7 @@ Then point it at your setup (env vars, with these defaults):
 | `PRSMASH_QUEUE_SCRIPT` | `~/.claude/skills/review-queue/scripts/review-queue.sh` | Queue script (a copy lives in `lib/review-queue.sh`) |
 | `PI_PRSMASH_MODEL` | _(unset)_ | Model passed to `pi --model`; overrides the saved model file |
 | `PRSMASH_MODEL_FILE` | `~/.prsmash/model` | One-line file holding the default model, managed by `prsmash-model` |
-| `PRSMASH_TRUSTED_AUTHORS` | `jaythegeek,corixdean,gsasu,beddial` | Authors whose large PRs may be approved automatically (empty disables the gate) |
+| `PRSMASH_TRUSTED_AUTHORS` | `bastiaan-bit,bethandutton,bram-lleverage,corixdean,eddial,emile-naude,gsasu,jaythegeek,joostverdoorn,lkooy,lorenzofiumi91,marcuslleverage,matteo-chi,noahvrijn,tijmenvanetten,tomvanwees-wq,tvdavies` | Authors whose large PRs may be approved automatically (empty disables the gate) |
 | `PRSMASH_APPROVAL_LINE_LIMIT` | `1001` | First changed-line count that requires an untrusted author to get human approval |
 | `PRSMASH_APPROVAL_MAX_LINES` | _(unset)_ | Legacy fallback name for `PRSMASH_APPROVAL_LINE_LIMIT` |
 | `PRSMASH_AUTO_APPROVE_ALL` | `false` | Set to `true` to bypass author and size gating for every eligible PR |

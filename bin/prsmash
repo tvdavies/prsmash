@@ -28,7 +28,7 @@ SLACK_APPROVAL_NOTIFY="${PRSMASH_SLACK_APPROVAL_NOTIFY:-true}"
 SLACK_APPROVAL_TARGET="${PRSMASH_SLACK_APPROVAL_TARGET:-@tom}"
 # Authors whose large PRs we are happy to have approved without a human looking.
 # Untrusted authors only need human sign-off when the changed-line limit is met.
-TRUSTED_AUTHORS="${PRSMASH_TRUSTED_AUTHORS-jaythegeek,corixdean,gsasu,beddial}"
+TRUSTED_AUTHORS="${PRSMASH_TRUSTED_AUTHORS-bastiaan-bit,bethandutton,bram-lleverage,corixdean,eddial,emile-naude,gsasu,jaythegeek,joostverdoorn,lkooy,lorenzofiumi91,marcuslleverage,matteo-chi,noahvrijn,tijmenvanetten,tomvanwees-wq,tvdavies}"
 APPROVAL_LINE_LIMIT="${PRSMASH_APPROVAL_LINE_LIMIT:-${PRSMASH_APPROVAL_MAX_LINES:-1001}}"
 AUTO_APPROVE_ALL="${PRSMASH_AUTO_APPROVE_ALL:-false}"
 # Reaction-driven approval. A PR held back for a human gets a DM; reacting to
