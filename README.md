@@ -50,16 +50,27 @@ For each selected PR, `prsmash`:
    ```bash
    pi --model "$MODEL" --session-dir <run>/sessions/pr-<N> \
       --skill "$PR_REVIEW_SKILL_DIR" \
-      -p "/skill:pr-review --headless --pr <N>"
+      -p "/skill:pr-review --headless --post --independent-checks --pr <N>"
    ```
 
 4. Appends the review that was actually posted to GitHub to the log,
    and cleans up worktrees and temp refs when the run finishes (also on
    Ctrl-C, including the whole child process tree).
 
-Reviews are guarded by locks: one global lock per machine (concurrent
-runs exit early) and one lock per PR (a PR already being reviewed by
-another run is skipped, not double-reviewed).
+Reviews are guarded by locks: interactive runs take a global lock, while
+scheduled runs overlap and take one lock per PR. A PR already being reviewed
+by another run is skipped, not double-reviewed.
+
+Reviews run independently of CI and CodeRabbit. The reviewer records their
+current status, assesses available findings, and publishes the code verdict
+without waiting for either check. Required checks still gate merging. CodeRabbit
+changes requests and unresolved threads do not hold up the review queue; other
+reviewers' blocking requests retain their existing queue behaviour.
+
+PRs changing 1,001 or more lines get up to two hours for their first attempt.
+Smaller reviews start at 45 minutes; after a timeout on the same head, the next
+attempt gets 90 minutes, then two hours. Successful reviews and new heads reset
+the small-PR budget. Scheduled runs allow 2h10m for review and cleanup.
 
 ## Human approval policy
 
@@ -178,7 +189,7 @@ When both conditions require human sign-off, the skill reports
 - `bash`, `jq`, `fzf`, `flock`, `git`, `curl` (for ntfy notifications)
 - [`gh` CLI](https://cli.github.com/) authenticated (`gh auth status`)
 - [pi](https://github.com/earendil-works/pi-coding-agent) on PATH
-- A `pr-review` skill that accepts `--headless --pr <N>`
+- A `pr-review` skill that accepts `--headless --post --independent-checks --pr <N>`
 - Optional, for Slack notifications and reaction approvals: a `slack.sh`
   helper supporting `resolve`, `send`, `profile` and `reactions`, plus
   `SLACK_MCP_XOXC_TOKEN` / `SLACK_MCP_XOXD_TOKEN` in the environment.
@@ -199,7 +210,7 @@ Then point it at your setup (env vars, with these defaults):
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `PRSMASH_SOURCE_REPO` | `~/dev/lleverage-ai/lleverage` | Local clone of the repo whose PRs you review |
-| `PR_REVIEW_SKILL_DIR` | `~/agent-skills/skills/general/pr-review` | The pi `pr-review` skill directory |
+| `PR_REVIEW_SKILL_DIR` | `~/.claude/skills/pr-review` | The pi `pr-review` skill directory |
 | `PRSMASH_QUEUE_SCRIPT` | `~/.claude/skills/review-queue/scripts/review-queue.sh` | Queue script (a copy lives in `lib/review-queue.sh`) |
 | `PI_PRSMASH_MODEL` | _(unset)_ | Model passed to `pi --model`; overrides the saved model file |
 | `PRSMASH_MODEL_FILE` | `~/.prsmash/model` | One-line file holding the default model, managed by `prsmash-model` |
@@ -208,7 +219,9 @@ Then point it at your setup (env vars, with these defaults):
 | `PRSMASH_APPROVAL_MAX_LINES` | _(unset)_ | Legacy fallback name for `PRSMASH_APPROVAL_LINE_LIMIT` |
 | `PRSMASH_AUTO_APPROVE_ALL` | `false` | Set to `true` to bypass author and size gating for every eligible PR |
 | `PI_PRSMASH_THINKING` | `high` | Reasoning level passed to `pi --thinking` |
-| `PRSMASH_REVIEW_TIMEOUT` | `2700` | Seconds before a single review is killed (p99 is ~32m) |
+| `PRSMASH_REVIEW_TIMEOUT` | `2700` | Initial timeout in seconds for smaller reviews |
+| `PRSMASH_MAX_REVIEW_TIMEOUT` | `7200` | Maximum timeout in seconds; used immediately for large PRs and after repeated timeouts |
+| `PRSMASH_LARGE_PR_LINES` | `1001` | Additions + deletions at which a PR gets the maximum timeout immediately |
 | `PRSMASH_LOG_DIR` | `~/.prsmash` | Locks, run logs, notification markers |
 | `PRSMASH_SLACK_SCRIPT` | `~/.claude/skills/slack/scripts/slack.sh` | Slack send helper |
 | `PRSMASH_SLACK_APPROVAL_NOTIFY` | `true` | Toggle Slack notifications |

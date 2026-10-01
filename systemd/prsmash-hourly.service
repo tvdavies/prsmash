@@ -50,13 +50,15 @@ ExecStart=/bin/sh -c ' \
     --working-directory=/home/tvd/dev/lleverage-ai/lleverage \
     --setenv=PATH="$$PATH" \
     --setenv=PRSMASH_LOG_DIR="$$PRSMASH_LOG_DIR" \
+    --setenv=PRSMASH_QUEUE_SCRIPT="$${PRSMASH_QUEUE_SCRIPT:-/home/tvd/.claude/skills/review-queue/scripts/review-queue.sh}" \
+    --setenv=PR_REVIEW_SKILL_DIR="$${PR_REVIEW_SKILL_DIR:-/home/tvd/.claude/skills/pr-review}" \
     --setenv=PI_CLAUDE_CODE_API_KEY_FILE="$$PI_CLAUDE_CODE_API_KEY_FILE" \
     --setenv=PI_CLAUDE_CODE_BASE_URL="$$PI_CLAUDE_CODE_BASE_URL" \
     --setenv=SLACK_MCP_XOXC_TOKEN="$$SLACK_MCP_XOXC_TOKEN" \
     --setenv=SLACK_MCP_XOXD_TOKEN="$$SLACK_MCP_XOXD_TOKEN" \
     --setenv=PRSMASH_NTFY_TOKEN="$$PRSMASH_NTFY_TOKEN" \
     --setenv=PRSMASH_ALLOW_CONCURRENT=1 \
-    --property=RuntimeMaxSec=3600 \
+    --property=RuntimeMaxSec=7800 \
     /home/tvd/.local/bin/prsmash --all'
 
 # Dispatch decisions stay in hourly.log (one line per tick, so no interleaving).

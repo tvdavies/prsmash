@@ -6,7 +6,7 @@ set -eo pipefail
 # Queue sources:
 #   review-request      — PRs where our review is explicitly requested
 #   threads-resolved    — PRs we previously blocked (CHANGES_REQUESTED/DISMISSED)
-#                         where the author has since resolved every review thread
+#                         where the author has since resolved every non-CodeRabbit review thread
 #                         and either pushed new commits or replied after our review.
 #                         Always included: the author has done everything GitHub
 #                         lets them do; waiting for an explicit re-request would
@@ -102,6 +102,7 @@ echo "$prs" | jq -c '.[]' | while read -r pr; do
           reviewThreads(first: 100) {
             nodes {
               isResolved
+              origin: comments(first: 1) { nodes { author { login } } }
               comments(last: 1) { nodes { author { login } createdAt } }
             }
           }
@@ -114,9 +115,11 @@ echo "$prs" | jq -c '.[]' | while read -r pr; do
   fi
 
   review_info=$(echo "$raw" | jq --arg me "$REVIEW_USER" '
+    def is_coderabbit: ascii_downcase | IN("coderabbitai", "coderabbitai[bot]");
     .data.repository.pullRequest as $pr
     | ($pr.reviews.nodes | map(select(.author.login != null)) | sort_by(.submittedAt)) as $reviews
-    | ($reviews | group_by(.author.login) | map(last)) as $latest_per_author
+    | ($reviews | group_by(.author.login) | map(last)
+        | map(select(.author.login | is_coderabbit | not))) as $latest_per_author
     | ([$reviews[] | select(.author.login == $me)] | last) as $mine
     | {
         head_oid: $pr.headRefOid,
@@ -127,6 +130,9 @@ echo "$prs" | jq -c '.[]' | while read -r pr; do
                     else {state: $mine.state, submittedAt: $mine.submittedAt, commit: ($mine.commit.oid // null)} end),
         threads_total: ($pr.reviewThreads.nodes | length),
         threads_unresolved: ([$pr.reviewThreads.nodes[] | select(.isResolved | not)] | length),
+        blocking_threads_unresolved: ([$pr.reviewThreads.nodes[]
+          | select(.isResolved | not)
+          | select((.origin.nodes[0].author.login // "" | is_coderabbit) | not)] | length),
         last_other_thread_activity: ([$pr.reviewThreads.nodes[].comments.nodes[]
                                        | select(.author.login != $me) | .createdAt] | max // null)
       }')
@@ -138,8 +144,8 @@ echo "$prs" | jq -c '.[]' | while read -r pr; do
     | (.last_commit != null and $mine_at != null and .last_commit > $mine_at) as $pushed_since
     | (.last_other_thread_activity != null and $mine_at != null and .last_other_thread_activity > $mine_at) as $replied_since
     | if $source == "review-request" then
-        # Never reviewed: review unless another reviewer is already blocking
-        # (the author has work to do first). Already reviewed: only re-review
+        # Never reviewed: do not wait for CodeRabbit; other blocking reviewers
+        # still hold the initial review. Already reviewed: only re-review
         # when the author pushed or replied since — re-reviewing an unchanged
         # PR on every run just re-rolls the findings dice and spams the author.
         (if .my_review.state == null then
@@ -148,7 +154,7 @@ echo "$prs" | jq -c '.[]' | while read -r pr; do
           {include: ($pushed_since or $replied_since), source: $source, implicitRereview: false}
         end)
       elif (.my_review.state == "CHANGES_REQUESTED" or .my_review.state == "DISMISSED")
-           and .threads_unresolved == 0
+           and .blocking_threads_unresolved == 0
            and ($pushed_since or $replied_since) then
         {include: true, source: "threads-resolved", implicitRereview: false}
       elif $implicit and .my_review.state != null and $pushed_since then

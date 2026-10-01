@@ -17,11 +17,13 @@
 set -eo pipefail
 
 QUEUE_SCRIPT="${PRSMASH_QUEUE_SCRIPT:-$HOME/.claude/skills/review-queue/scripts/review-queue.sh}"
-PR_REVIEW_SKILL_DIR="${PR_REVIEW_SKILL_DIR:-$HOME/agent-skills/skills/general/pr-review}"
+PR_REVIEW_SKILL_DIR="${PR_REVIEW_SKILL_DIR:-$HOME/.claude/skills/pr-review}"
 PRSMASH_SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}")
 PRSMASH_LIB_DIR="${PRSMASH_LIB_DIR:-$(dirname "$PRSMASH_SCRIPT_PATH")/../lib}"
 # shellcheck source=../lib/review-disposition-state.sh
 source "$PRSMASH_LIB_DIR/review-disposition-state.sh"
+# shellcheck source=../lib/review-timeout.sh
+source "$PRSMASH_LIB_DIR/review-timeout.sh"
 PRSMASH_SOURCE_REPO="${PRSMASH_SOURCE_REPO:-$HOME/dev/lleverage-ai/lleverage}"
 SLACK_SCRIPT="${PRSMASH_SLACK_SCRIPT:-$HOME/.claude/skills/slack/scripts/slack.sh}"
 SLACK_APPROVAL_NOTIFY="${PRSMASH_SLACK_APPROVAL_NOTIFY:-true}"
@@ -40,12 +42,12 @@ REJECT_REACTIONS="${PRSMASH_REJECT_REACTIONS:--1,thumbsdown,x,no_entry_sign}"
 APPROVAL_PENDING_TTL_DAYS="${PRSMASH_APPROVAL_PENDING_TTL_DAYS:-14}"
 # Whose reaction counts. Defaults to the Slack user the tokens belong to.
 APPROVAL_ACTOR="${PRSMASH_SLACK_APPROVAL_USER:-}"
-# Hard cap on a single review. A review agent can spawn a child that never exits
-# (e.g. importing react-dom/server.browser.js under node keeps the event loop
-# alive forever), which otherwise wedges the run, the systemd unit, and every
-# subsequent timer firing. p99 review duration is ~32m, so 45m only cuts runs
-# that are already pathological.
+# Small reviews start at 45 minutes. Large PRs get two hours immediately;
+# a smaller PR that times out gets a longer budget on its next attempt.
 REVIEW_TIMEOUT="${PRSMASH_REVIEW_TIMEOUT:-2700}"
+MAX_REVIEW_TIMEOUT="${PRSMASH_MAX_REVIEW_TIMEOUT:-7200}"
+LARGE_PR_LINES="${PRSMASH_LARGE_PR_LINES:-1001}"
+validate_review_timeout_config "$REVIEW_TIMEOUT" "$MAX_REVIEW_TIMEOUT" "$LARGE_PR_LINES"
 # ntfy.sh push notifications. Every action taken on a PR (approve, request
 # changes, comment, review held for human approval) publishes to the topic;
 # failures publish at ntfy's most urgent priority so they cut through on a
@@ -988,6 +990,7 @@ run_pr_review() {
   local pr_number=$1
   local pr_repo=$2
   local since_commit=$3
+  local review_timeout=$4
   local session_dir="$RUN_DIR/sessions/pr-${pr_number}"
   local worktree_dir="$RUN_DIR/worktrees/pr-${pr_number}"
   local tmp_dir="$RUN_DIR/tmp/pr-${pr_number}"
@@ -1002,12 +1005,12 @@ run_pr_review() {
   # Incremental re-review: when we know the commit our last review looked at,
   # narrow the review to what changed since. Only valid if that commit is an
   # ancestor of the current head (a rebase/force-push invalidates it).
-  local skill_cmd="/skill:pr-review --headless --post --pr ${pr_number}"
+  local skill_cmd="/skill:pr-review --headless --post --independent-checks --pr ${pr_number}"
   if [[ -n "$since_commit" && "$since_commit" != "null" ]]; then
     if git -C "$worktree_dir" cat-file -e "$since_commit" 2>/dev/null \
        && git -C "$worktree_dir" merge-base --is-ancestor "$since_commit" HEAD 2>/dev/null \
        && [[ "$since_commit" != "$(git -C "$worktree_dir" rev-parse HEAD)" ]]; then
-      skill_cmd="/skill:pr-review --headless --post --pr ${pr_number} --since ${since_commit}"
+      skill_cmd="/skill:pr-review --headless --post --independent-checks --pr ${pr_number} --since ${since_commit}"
       echo "incrementalReviewSince=${since_commit}"
     else
       echo "incrementalReviewSince=invalid (${since_commit} not an ancestor of head; running full review)"
@@ -1023,7 +1026,8 @@ run_pr_review() {
   fi
   # Keep the timeout inside setsid: `setsid pi` may fork rather than exec, which
   # would let an outer timeout return before pi has finished.
-  local runner=(timeout --kill-after=60 "$REVIEW_TIMEOUT" pi "${args[@]}")
+  echo "reviewTimeoutSeconds=${review_timeout}"
+  local runner=(timeout --kill-after=60 "$review_timeout" pi "${args[@]}")
   if command -v setsid >/dev/null 2>&1; then
     runner=(setsid "${runner[@]}")
   fi
@@ -1031,7 +1035,7 @@ run_pr_review() {
   local rc=0
   (cd "$worktree_dir" && TMPDIR="$tmp_dir" PR_REVIEW_TMPDIR="$tmp_dir" PRSMASH_REVIEW_RESULT_FILE="$result_file" PRSMASH_REVIEW_EXPECTED_HEAD="$analyzed_head" PRSMASH_APPROVAL_LINE_LIMIT="$APPROVAL_LINE_LIMIT" PRSMASH_TRUSTED_AUTHORS="$TRUSTED_AUTHORS" PRSMASH_AUTO_APPROVE_ALL="$AUTO_APPROVE_ALL" "${runner[@]}") || rc=$?
   if [[ $rc -eq 124 || $rc -eq 137 ]]; then
-    echo "PRSMASH_REVIEW_TIMEOUT: killed after ${REVIEW_TIMEOUT}s"
+    echo "PRSMASH_REVIEW_TIMEOUT: killed after ${review_timeout}s"
   fi
   return $rc
 }
@@ -1067,6 +1071,7 @@ review_pr_bg() {
   local head_oid=$6
   local start end duration attempt=1 latest_state lock_name disposition_source
   local result_file result_head result_posting result_manual analyzed_head
+  local pr_meta changed_lines timeout_file timeout_count review_timeout review_rc
 
   lock_name=$(printf '%s-%s' "$pr_repo" "$pr_number" | tr '/:' '__')
   exec {pr_lock_fd}>"$LOG_ROOT/locks/pr-${lock_name}.lock"
@@ -1078,20 +1083,37 @@ review_pr_bg() {
   # The queue may have been fetched while an overlapping run was finishing or
   # while the author pushed. Refresh GitHub under the per-PR lock, then check the
   # exact current head against the disposition written by the previous holder.
-  if ! head_oid=$(gh api "repos/${pr_repo}/pulls/${pr_number}" --jq '.head.sha' 2>/dev/null) \
-      || [[ ! "$head_oid" =~ ^[0-9a-fA-F]{7,64}$ ]]; then
+  if ! pr_meta=$(gh api "repos/${pr_repo}/pulls/${pr_number}" 2>/dev/null) \
+      || ! jq -e '.head.sha | test("^[0-9a-fA-F]{40}$")' >/dev/null 2>&1 <<<"$pr_meta"; then
     echo "Could not refresh the current head for ${pr_repo}#${pr_number}; refusing to launch a review." > "$log_file"
     printf 'ERR||0\n' > "$status_file"
     return 1
   fi
+  head_oid=$(jq -r '.head.sha' <<<"$pr_meta")
   if review_disposition_exists "$pr_repo" "$pr_number" "$head_oid"; then
     printf 'HANDLED||0\n' > "$status_file"
     return 0
   fi
 
+  if ! changed_lines=$(jq -er '
+      [.additions, .deletions] as $lines
+      | if all($lines[]; type == "number" and . >= 0 and floor == .)
+        then $lines | add else error("missing PR line counts") end' <<<"$pr_meta"); then
+    echo "Could not determine the review timeout for ${pr_repo}#${pr_number}: missing PR line counts." > "$log_file"
+    printf 'ERR||0\n' > "$status_file"
+    return 1
+  fi
+  mkdir -p "$LOG_ROOT/review-timeouts"
+  timeout_file="$LOG_ROOT/review-timeouts/${lock_name}-${head_oid}.json"
+  timeout_count=$(review_timeout_count "$timeout_file")
+  review_timeout=$(review_timeout_seconds "$changed_lines" "$timeout_count" "$REVIEW_TIMEOUT" "$MAX_REVIEW_TIMEOUT" "$LARGE_PR_LINES")
+
   start=$(date +%s)
   while [[ $attempt -le $MAX_RETRIES ]]; do
-    if run_pr_review "$pr_number" "$pr_repo" "$since_commit" > "$log_file" 2>&1; then
+    review_rc=0
+    run_pr_review "$pr_number" "$pr_repo" "$since_commit" "$review_timeout" > "$log_file" 2>&1 || review_rc=$?
+    if [[ "$review_rc" -eq 0 ]]; then
+      rm -f "$timeout_file"
       end=$(date +%s)
       duration=$((end - start))
       # GitHub's effective review state ignores COMMENTED reviews — only
@@ -1126,6 +1148,10 @@ review_pr_bg() {
       fi
       printf 'OK|%s|%d\n' "$latest_state" "$duration" > "$status_file"
       return 0
+    fi
+    if [[ "$review_rc" -eq 124 || "$review_rc" -eq 137 ]]; then
+      record_review_timeout "$timeout_file" "$((timeout_count + 1))"
+      break
     fi
     if [[ $attempt -lt $MAX_RETRIES ]] && is_retryable "$log_file"; then
       sleep "$RETRY_DELAY"
