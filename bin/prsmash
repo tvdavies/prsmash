@@ -24,6 +24,8 @@ PRSMASH_LIB_DIR="${PRSMASH_LIB_DIR:-$(dirname "$PRSMASH_SCRIPT_PATH")/../lib}"
 source "$PRSMASH_LIB_DIR/review-disposition-state.sh"
 # shellcheck source=../lib/review-timeout.sh
 source "$PRSMASH_LIB_DIR/review-timeout.sh"
+# shellcheck source=../lib/review-outcome.sh
+source "$PRSMASH_LIB_DIR/review-outcome.sh"
 PRSMASH_SOURCE_REPO="${PRSMASH_SOURCE_REPO:-$HOME/dev/lleverage-ai/lleverage}"
 SLACK_SCRIPT="${PRSMASH_SLACK_SCRIPT:-$HOME/.claude/skills/slack/scripts/slack.sh}"
 SLACK_APPROVAL_NOTIFY="${PRSMASH_SLACK_APPROVAL_NOTIFY:-true}"
@@ -384,28 +386,12 @@ ntfy_publish() {
 # systemic outage does not hammer the phone every tick.
 notify_pr_ntfy() {
   local kind=$1 pr_number=$2 pr_repo=$3 pr_title=$4 pr_author=$5 time_str=$6
-  local title priority tags body pr_url marker_file safe_key
+  local title priority tags body pr_url marker_file safe_key spec
 
   [[ "$NTFY_NOTIFY" == "true" ]] || return 0
 
-  case "$kind" in
-    approved)
-      title="Approved #${pr_number}"
-      priority=default; tags=white_check_mark ;;
-    changes-requested)
-      title="Changes requested on #${pr_number}"
-      priority=high; tags=warning ;;
-    commented)
-      title="Commented on #${pr_number}"
-      priority=default; tags=speech_balloon ;;
-    awaiting-approval)
-      title="Needs your approval: #${pr_number}"
-      priority=high; tags=eyes ;;
-    failed)
-      title="Review FAILED for #${pr_number}"
-      priority=urgent; tags=rotating_light ;;
-    *) return 0 ;;
-  esac
+  spec=$(ntfy_message_spec "$kind" "$pr_number") || return 0
+  IFS=$'\t' read -r title priority tags <<<"$spec"
 
   if [[ "$kind" == "failed" ]] \
       && [[ "$NTFY_FAILURE_COOLDOWN_MINS" =~ ^[0-9]+$ ]] && [[ "$NTFY_FAILURE_COOLDOWN_MINS" -gt 0 ]]; then
@@ -419,11 +405,7 @@ notify_pr_ntfy() {
   fi
 
   pr_url="https://github.com/${pr_repo}/pull/${pr_number}"
-  if [[ "$kind" == "failed" ]]; then
-    body=$(printf '%s (%s) — review errored after %s' "$pr_title" "$pr_author" "$time_str")
-  else
-    body=$(printf '%s (%s) — %s' "$pr_title" "$pr_author" "$time_str")
-  fi
+  body=$(ntfy_message_body "$kind" "$pr_title" "$pr_author" "$time_str")
 
   if ntfy_publish "$title" "$priority" "$tags" "$body" "$pr_url"; then
     [[ -n "${marker_file:-}" ]] && date -Is > "$marker_file"
@@ -895,6 +877,8 @@ reviewed=0
 approved=0
 manual_approval=0
 changes_requested=0
+incomplete=0
+not_posted=0
 errored=0
 # A PR already being reviewed by an overlapping run is a routine outcome now
 # that scheduled runs overlap, not a failure. Counting it separately keeps
@@ -1047,7 +1031,10 @@ append_latest_review_body() {
 
   {
     echo ""
-    echo "========== Posted GitHub review =========="
+    # The latest review of ours on GitHub. It can predate this run (an
+    # unposted round leaves the previous review here), so it is shown for
+    # context only; the run's own outcome is in the status file.
+    echo "========== Latest GitHub review by us (may predate this run) =========="
     gh api --paginate --slurp "repos/${pr_repo}/pulls/${pr_number}/reviews" 2>/dev/null \
       | jq -r --arg me "$user" '
           [.[] | .[] | select(.user.login == $me)] | last as $review
@@ -1058,7 +1045,7 @@ append_latest_review_body() {
             end
         ' \
       || echo "Failed to fetch posted GitHub review body."
-    echo "========== End posted GitHub review =========="
+    echo "========== End latest GitHub review =========="
   } >> "$log_file"
 }
 
@@ -1070,7 +1057,7 @@ review_pr_bg() {
   local since_commit=$5
   local head_oid=$6
   local start end duration attempt=1 latest_state lock_name disposition_source
-  local result_file result_head result_posting result_manual analyzed_head
+  local result_file analyzed_head reviews_json started_at outcome
   local pr_meta changed_lines timeout_file timeout_count review_timeout review_rc
 
   lock_name=$(printf '%s-%s' "$pr_repo" "$pr_number" | tr '/:' '__')
@@ -1109,6 +1096,7 @@ review_pr_bg() {
   review_timeout=$(review_timeout_seconds "$changed_lines" "$timeout_count" "$REVIEW_TIMEOUT" "$MAX_REVIEW_TIMEOUT" "$LARGE_PR_LINES")
 
   start=$(date +%s)
+  started_at=$(date -u -d "@$start" +%Y-%m-%dT%H:%M:%SZ)
   while [[ $attempt -le $MAX_RETRIES ]]; do
     review_rc=0
     run_pr_review "$pr_number" "$pr_repo" "$since_commit" "$review_timeout" > "$log_file" 2>&1 || review_rc=$?
@@ -1116,35 +1104,27 @@ review_pr_bg() {
       rm -f "$timeout_file"
       end=$(date +%s)
       duration=$((end - start))
-      # GitHub's effective review state ignores COMMENTED reviews — only
-      # APPROVED/CHANGES_REQUESTED change state. Prefer the latest of those.
+      # The status must describe what this run did. GitHub's effective review
+      # state can belong to an older head (an unposted INCOMPLETE round once
+      # reported the previous CHANGES_REQUESTED and notified on it), so the
+      # outcome comes from the posting helper's result file, falling back only
+      # to a review GitHub holds for this exact head from during this run.
       # Paginate: a single page (30) can miss recent reviews on busy PRs.
-      latest_state=$(gh api --paginate --slurp "repos/${pr_repo}/pulls/${pr_number}/reviews" 2>/dev/null \
-        | jq -r --arg me "$user" '
-            [.[] | .[]] as $all
-            | ([$all[] | select(.user.login == $me) | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED")] | last | .state)
-            // ([$all[] | select(.user.login == $me)] | last | .state)
-            // "UNKNOWN"
-          ' 2>/dev/null || echo "UNKNOWN")
+      reviews_json=$(gh api --paginate --slurp "repos/${pr_repo}/pulls/${pr_number}/reviews" 2>/dev/null || echo '[]')
       append_latest_review_body "$pr_number" "$pr_repo" "$log_file"
-      disposition_source=""
       result_file="$RUN_DIR/tmp/pr-${pr_number}/review-result.json"
       analyzed_head=$(git -C "$RUN_DIR/worktrees/pr-${pr_number}" rev-parse HEAD 2>/dev/null || true)
-      if jq -e --arg repo "$pr_repo" --argjson pr "$pr_number" --arg head "$analyzed_head" \
-          '.repo == $repo and .pr == $pr and .head == $head' "$result_file" >/dev/null 2>&1; then
-        result_head=$(jq -r '.head // empty' "$result_file")
-        result_posting=$(jq -r '.posting // empty' "$result_file")
-        result_manual=$(jq -r '.manualApprovalRequired // false' "$result_file")
-        if [[ "$result_manual" == "true" ]]; then
-          latest_state="MANUAL_APPROVAL_REQUIRED"
-          disposition_source="manual-approval-required"
-        elif [[ "$result_posting" == "issue-comment" ]]; then
-          disposition_source="issue-comment-review"
-        fi
-        if [[ -n "$disposition_source" ]] \
-            && ! record_review_disposition "$pr_repo" "$pr_number" "$result_head" "$disposition_source"; then
-          echo "Could not persist the review disposition for ${pr_repo}#${pr_number} at ${result_head}; this head may be reviewed again." >&2
-        fi
+      [[ -n "$analyzed_head" ]] || analyzed_head="$head_oid"
+      outcome=$(review_run_outcome "$result_file" "$pr_repo" "$pr_number" "$analyzed_head" \
+        "$reviews_json" "$user" "$started_at")
+      IFS=$'\t' read -r latest_state disposition_source <<<"$outcome"
+      echo "prsmashOutcome=${latest_state} head=${analyzed_head} disposition=${disposition_source:-none}" >> "$log_file"
+      # Record anything GitHub review state will not stop by itself, including
+      # an INCOMPLETE round and a run that published nothing, so later runs
+      # skip this head until a new commit arrives.
+      if [[ -n "$disposition_source" ]] \
+          && ! record_review_disposition "$pr_repo" "$pr_number" "$analyzed_head" "$disposition_source"; then
+        echo "Could not persist the review disposition for ${pr_repo}#${pr_number} at ${analyzed_head}; this head may be reviewed again." >&2
       fi
       printf 'OK|%s|%d\n' "$latest_state" "$duration" > "$status_file"
       return 0
@@ -1238,29 +1218,39 @@ while [[ $completed -lt $total ]]; do
     OK:APPROVED)
       echo -e "${prefix} ${GREEN}Approved${RESET} ${suffix}"
       notify_approval_slack approved "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$log_file" || true
-      notify_pr_ntfy approved "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$time_str" || true
+      notify_pr_ntfy "$(ntfy_kind_for_state "$latest_state")" "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$time_str" || true
       approved=$((approved + 1))
       reviewed=$((reviewed + 1)) ;;
     OK:MANUAL_APPROVAL_REQUIRED)
       echo -e "${prefix} ${YELLOW}Review posted, awaiting your approval${RESET} ${suffix}"
       notify_approval_slack awaiting-approval "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$log_file" || true
-      notify_pr_ntfy awaiting-approval "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$time_str" || true
+      notify_pr_ntfy "$(ntfy_kind_for_state "$latest_state")" "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$time_str" || true
       manual_approval=$((manual_approval + 1))
       reviewed=$((reviewed + 1)) ;;
     OK:CHANGES_REQUESTED)
       echo -e "${prefix} ${RED}Changes requested${RESET} ${suffix}"
-      notify_pr_ntfy changes-requested "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$time_str" || true
+      notify_pr_ntfy "$(ntfy_kind_for_state "$latest_state")" "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$time_str" || true
       changes_requested=$((changes_requested + 1))
+      reviewed=$((reviewed + 1)) ;;
+    OK:INCOMPLETE)
+      echo -e "${prefix} ${YELLOW}Review incomplete${RESET} ${suffix} ${DIM}— commented, not approved; head recorded as handled${RESET}"
+      notify_pr_ntfy "$(ntfy_kind_for_state "$latest_state")" "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$time_str" || true
+      incomplete=$((incomplete + 1))
+      reviewed=$((reviewed + 1)) ;;
+    OK:NOT_POSTED)
+      echo -e "${prefix} ${YELLOW}Not posted${RESET} ${suffix} ${DIM}— reviewer published nothing; head recorded as handled, see ${log_file}${RESET}"
+      notify_pr_ntfy "$(ntfy_kind_for_state "$latest_state")" "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$time_str" || true
+      not_posted=$((not_posted + 1))
       reviewed=$((reviewed + 1)) ;;
     OK:*)
       echo -e "${prefix} ${BLUE}Commented${RESET} ${suffix}"
-      notify_pr_ntfy commented "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$time_str" || true
+      notify_pr_ntfy "$(ntfy_kind_for_state "$latest_state")" "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$time_str" || true
       reviewed=$((reviewed + 1)) ;;
     LOCKED:*)
       echo -e "${prefix} ${YELLOW}Skipped${RESET} ${suffix} ${DIM}— already being reviewed${RESET}"
       skipped=$((skipped + 1)) ;;
     HANDLED:*)
-      echo -e "${prefix} ${YELLOW}Skipped${RESET} ${suffix} ${DIM}— this exact head already passed automated review${RESET}"
+      echo -e "${prefix} ${YELLOW}Skipped${RESET} ${suffix} ${DIM}— this exact head was already handled by an automated review${RESET}"
       skipped=$((skipped + 1)) ;;
     *)
       echo -e "${prefix} ${RED}Error${RESET} ${suffix} ${DIM}— see ${log_file}${RESET}"
@@ -1277,6 +1267,8 @@ skipped=$skipped
 approved=$approved
 awaiting_manual_approval=$manual_approval
 changes_requested=$changes_requested
+incomplete=$incomplete
+not_posted=$not_posted
 EOF
 
 cleanup_run_resources
@@ -1289,5 +1281,11 @@ if [[ "$skipped" -gt 0 ]]; then
 fi
 if [[ "$manual_approval" -gt 0 ]]; then
   echo -e "  ${YELLOW}${manual_approval} awaiting your approval${RESET} ${DIM}— review posted, approval left to you${RESET}"
+fi
+if [[ "$incomplete" -gt 0 ]]; then
+  echo -e "  ${YELLOW}${incomplete} incomplete${RESET} ${DIM}— commented with the missing coverage; not approved${RESET}"
+fi
+if [[ "$not_posted" -gt 0 ]]; then
+  echo -e "  ${YELLOW}${not_posted} not posted${RESET} ${DIM}— reviewer published nothing; check the logs${RESET}"
 fi
 echo -e "  ${DIM}logs: ${RUN_DIR}${RESET}"

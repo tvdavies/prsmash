@@ -70,4 +70,24 @@ run_case 0 '[]' "[$pr]" "$own_thread" >/dev/null
 unchanged=$(jq '.data.repository.pullRequest.commits.nodes[0].commit.committedDate = "2026-09-30T10:00:00Z"' <<<"$mine")
 run_case 0 "[$pr]" '[]' "$unchanged" >/dev/null
 
+# An INCOMPLETE round posts a COMMENTED review on the new head after an earlier
+# CHANGES_REQUESTED. That head is now handled: neither a lingering review
+# request nor the previously-reviewed path may pick it up again.
+incomplete=$(jq --arg old "$reviewed_head" --arg new "$new_head" '.data.repository.pullRequest.reviews.nodes = [
+  {author:{login:"alice"},state:"CHANGES_REQUESTED",submittedAt:"2026-09-30T11:00:00Z",commit:{oid:$old}},
+  {author:{login:"alice"},state:"COMMENTED",submittedAt:"2026-09-30T13:00:00Z",commit:{oid:$new}}
+]' <<<"$base")
+run_case 0 "[$pr]" '[]' "$incomplete" >/dev/null
+run_case 0 '[]' "[$pr]" "$incomplete" >/dev/null
+
+# The next push re-enters through threads-resolved: the COMMENTED review does
+# not hide the standing block, and the incremental base is the incomplete head.
+pushed_after=$(jq '.data.repository.pullRequest.commits.nodes[0].commit.committedDate = "2026-09-30T14:00:00Z"' <<<"$incomplete")
+result=$(run_case 1 '[]' "[$pr]" "$pushed_after")
+jq -e --arg new "$new_head" '.prs[0].queueSource == "threads-resolved"
+  and .prs[0].myReviewState == "CHANGES_REQUESTED"
+  and .prs[0].myReviewCommit == $new
+  and .prs[0].myReviewAt == "2026-09-30T13:00:00Z"' <<<"$result" >/dev/null \
+  || { echo "INCOMPLETE head did not re-enter on push: $result" >&2; exit 1; }
+
 echo "review queue tests passed"

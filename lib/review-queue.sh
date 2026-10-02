@@ -120,14 +120,21 @@ echo "$prs" | jq -c '.[]' | while read -r pr; do
     | ($pr.reviews.nodes | map(select(.author.login != null)) | sort_by(.submittedAt)) as $reviews
     | ($reviews | group_by(.author.login) | map(last)
         | map(select(.author.login | is_coderabbit | not))) as $latest_per_author
-    | ([$reviews[] | select(.author.login == $me)] | last) as $mine
+    | ([$reviews[] | select(.author.login == $me)]) as $mine_all
+    | ($mine_all | last) as $mine
+    # A COMMENTED review (an INCOMPLETE round, or inline comments alongside a
+    # non-blocking comment) records that we looked at a head, but it does not
+    # replace our effective verdict. Keep its time and commit, so an unchanged
+    # head is not re-reviewed, but report the latest approving, blocking or
+    # dismissed state, so a later push still finds the threads-resolved path.
+    | ($mine_all | map(select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")) | last) as $mine_effective
     | {
         head_oid: $pr.headRefOid,
         last_commit: ($pr.commits.nodes | last | .commit.committedDate),
         changes_requested: ([$latest_per_author[] | select(.state == "CHANGES_REQUESTED")] | length),
         all_cr_authors: [$latest_per_author[] | select(.state == "CHANGES_REQUESTED") | .author.login],
         my_review: (if $mine == null then {state: null, submittedAt: null, commit: null}
-                    else {state: $mine.state, submittedAt: $mine.submittedAt, commit: ($mine.commit.oid // null)} end),
+                    else {state: (($mine_effective // $mine).state), submittedAt: $mine.submittedAt, commit: ($mine.commit.oid // null)} end),
         threads_total: ($pr.reviewThreads.nodes | length),
         threads_unresolved: ([$pr.reviewThreads.nodes[] | select(.isResolved | not)] | length),
         blocking_threads_unresolved: ([$pr.reviewThreads.nodes[]

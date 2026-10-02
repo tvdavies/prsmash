@@ -53,9 +53,19 @@ For each selected PR, `prsmash`:
       -p "/skill:pr-review --headless --post --independent-checks --pr <N>"
    ```
 
-4. Appends the review that was actually posted to GitHub to the log,
-   and cleans up worktrees and temp refs when the run finishes (also on
-   Ctrl-C, including the whole child process tree).
+4. Records the run's own outcome from the posting helper's result file
+   (never from an older GitHub review), appends our latest GitHub review
+   to the log for context, and cleans up worktrees and temp refs when the
+   run finishes (also on Ctrl-C, including the whole child process tree).
+
+A review that ends `INCOMPLETE` (required coverage missing, nothing critical
+found) is posted as a COMMENTED review on the reviewed head. It says what was
+verified, what is resolved and exactly what is still missing; it never
+approves, requests changes or dismisses an earlier blocking review. That head
+is then recorded in `review-dispositions/` and skipped until a new commit
+arrives. A run that finishes without publishing anything is reported as
+`NOT_POSTED` and recorded the same way, so neither outcome is re-reviewed on
+every tick.
 
 Reviews are guarded by locks: interactive runs take a global lock, while
 scheduled runs overlap and take one lock per PR. A PR already being reviewed
@@ -121,10 +131,13 @@ notifications — subscribe to the topic in the ntfy app:
 | Commented | default | 💬 |
 | Changes requested | high | ⚠️ |
 | Awaiting your approval | high | 👀 |
+| Review incomplete (commented, not approved) | default | ⌛ |
+| Review not posted (head will not be retried) | high | ❔ |
 | Review failed | **urgent** (max) | 🚨 |
 
-Each notification links to the PR (tap to open). Skips (`LOCKED`,
-`HANDLED`) are silent — nothing was done to the PR. A run that dies
+Each notification describes what this run did, never an earlier review
+still showing on GitHub. Each notification links to the PR (tap to open).
+Skips (`LOCKED`, `HANDLED`) are silent — nothing was done to the PR. A run that dies
 before reviewing (invalid queue response) also publishes an urgent
 failure.
 
@@ -300,6 +313,10 @@ systemctl --user enable --now prsmash-hourly.timer
 ```
 bin/prsmash                    the main script
 lib/review-queue.sh            builds the PR queue JSON (gh + jq)
+lib/review-outcome.sh          maps a finished review to its status and ntfy message
+lib/review-disposition-state.sh  exact heads already handled outside GitHub review state
+lib/review-timeout.sh          adaptive review timeouts
+tests/*.test.sh                bash tests with stubbed gh, pi and curl
 systemd/prsmash-hourly.*       half-hourly timer for prsmash --all
 ```
 
@@ -308,8 +325,10 @@ Each run writes to `$PRSMASH_LOG_DIR/runs/<run-id>/` (symlinked from
 
 ```
 queue.json               the queue that was fetched
-pr-<N>-<repo>.log        full review log + posted GitHub review body
-pr-<N>.status            machine-readable outcome
+pr-<N>-<repo>.log        full review log + our latest GitHub review body
+pr-<N>.status            machine-readable outcome: OK|<STATE>|<secs>, LOCKED, HANDLED or ERR
+                         (STATE: APPROVED, CHANGES_REQUESTED, COMMENTED,
+                         MANUAL_APPROVAL_REQUIRED, INCOMPLETE, NOT_POSTED)
 sessions/pr-<N>/         pi session for the review
 summary.txt              reviewed/approved/errored counts
 ```

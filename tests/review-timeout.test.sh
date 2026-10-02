@@ -66,6 +66,13 @@ TIMEOUT
 cat > "$TMP/bin/pi" <<'PI'
 #!/usr/bin/env bash
 printf '%s\n' "$*" > "$TEST_PI_CAPTURE"
+# A successful review posts through the helper, which writes its result file.
+# Without one the run counts as NOT_POSTED and the head is recorded as handled.
+if [[ "$TEST_PI_EXIT" == 0 && -n "${PRSMASH_REVIEW_RESULT_FILE:-}" ]]; then
+  jq -n --arg head "$PRSMASH_REVIEW_EXPECTED_HEAD" '{repo:"example/widgets",pr:5938,head:$head,
+    posting:"github-review",event:"APPROVE",verdict:"APPROVE",manualApprovalRequired:false}' \
+    > "$PRSMASH_REVIEW_RESULT_FILE"
+fi
 exit "$TEST_PI_EXIT"
 PI
 chmod +x "$TMP/queue.sh" "$TMP/bin/gh" "$TMP/bin/pi" "$TMP/bin/timeout"
