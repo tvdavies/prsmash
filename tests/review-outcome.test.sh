@@ -118,4 +118,10 @@ if ntfy_message_spec bogus 7250 >/dev/null; then
   fail "unknown ntfy kind produced a message"
 fi
 
+[[ $(ntfy_kind_for_state CONFLICTING) == conflicting ]] || fail "CONFLICTING kind"
+IFS=$'\t' read -r title priority tags <<<"$(ntfy_message_spec conflicting 7250)"
+[[ "$title" == "Merge conflicts on #7250" && "$priority" == default ]] || fail "conflicting ntfy spec"
+ntfy_message_body conflicting "Title" alice 0m0s | grep -q 're-review once resolved' \
+  || fail "conflicting body does not promise the re-review"
+
 echo "review-outcome tests passed"

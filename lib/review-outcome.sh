@@ -13,6 +13,9 @@
 #   MANUAL_APPROVAL_REQUIRED  approval held back for a human (comment posted)
 #   INCOMPLETE                a COMMENTED "review incomplete" review was posted
 #   NOT_POSTED                the reviewer finished but published nothing
+#   CONFLICTING               not reviewed: the branch conflicts with its base
+#                             and a conflict notice was posted instead
+#                             (written by prsmash itself, not by this function)
 
 # review_run_outcome RESULT_FILE REPO PR HEAD REVIEWS_JSON LOGIN STARTED_AT
 #
@@ -82,6 +85,7 @@ ntfy_kind_for_state() {
     MANUAL_APPROVAL_REQUIRED) echo awaiting-approval ;;
     INCOMPLETE) echo incomplete ;;
     NOT_POSTED) echo not-posted ;;
+    CONFLICTING) echo conflicting ;;
     *) echo commented ;;
   esac
 }
@@ -97,6 +101,7 @@ ntfy_message_spec() {
     awaiting-approval) printf 'Needs your approval: #%s\thigh\teyes\n' "$pr_number" ;;
     incomplete) printf 'Review incomplete on #%s\tdefault\thourglass\n' "$pr_number" ;;
     not-posted) printf 'Review not posted for #%s\thigh\tgrey_question\n' "$pr_number" ;;
+    conflicting) printf 'Merge conflicts on #%s\tdefault\tconstruction\n' "$pr_number" ;;
     failed) printf 'Review FAILED for #%s\turgent\trotating_light\n' "$pr_number" ;;
     *) return 1 ;;
   esac
@@ -109,6 +114,7 @@ ntfy_message_body() {
     failed) printf '%s (%s) — review errored after %s' "$pr_title" "$pr_author" "$time_str" ;;
     incomplete) printf '%s (%s) — commented, not approved: required coverage still missing (%s)' "$pr_title" "$pr_author" "$time_str" ;;
     not-posted) printf '%s (%s) — review finished but published nothing; this head will not be retried (%s)' "$pr_title" "$pr_author" "$time_str" ;;
+    conflicting) printf '%s (%s) — conflicts with its base; posted the files, will re-review once resolved' "$pr_title" "$pr_author" ;;
     *) printf '%s (%s) — %s' "$pr_title" "$pr_author" "$time_str" ;;
   esac
 }

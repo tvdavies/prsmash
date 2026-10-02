@@ -58,14 +58,32 @@ For each selected PR, `prsmash`:
    to the log for context, and cleans up worktrees and temp refs when the
    run finishes (also on Ctrl-C, including the whole child process tree).
 
-A review that ends `INCOMPLETE` (required coverage missing, nothing critical
-found) is posted as a COMMENTED review on the reviewed head. It says what was
-verified, what is resolved and exactly what is still missing; it never
-approves, requests changes or dismisses an earlier blocking review. That head
-is then recorded in `review-dispositions/` and skipped until a new commit
-arrives. A run that finishes without publishing anything is reported as
-`NOT_POSTED` and recorded the same way, so neither outcome is re-reviewed on
-every tick.
+Before reviewing, prsmash asks GitHub whether the PR merges cleanly (polling
+briefly while GitHub computes it). A PR that conflicts with its base is not
+reviewed. Instead prsmash trial-merges the head into the current base tip with
+`git merge-tree`, posts one short comment naming the conflicting files
+(modify/delete and rename conflicts flagged first), says who has to do what,
+and promises a re-review once the branch merges cleanly. It posts again only
+when the set of conflicting files changes. `prsmash-merge-check PR` prints the
+notice prsmash would post, without posting anything.
+
+Every finished outcome (approval, changes requested, `INCOMPLETE`,
+`NOT_POSTED`, merge conflict) is recorded against its exact head in
+`review-dispositions/`, so overlapping runs never review one head twice. A
+recorded head is reviewed again when:
+
+- a new commit arrives (a new head);
+- it was recorded as conflicting and GitHub now reports it mergeable;
+- a person other than us comments on the PR or a review thread after that
+  review started, for example to post evidence or a decision. Bots do not
+  count, and this is capped at `PRSMASH_MAX_ACTIVITY_REREVIEWS` (default 2)
+  extra looks per head, so a reply loop cannot recreate the old review loop.
+
+A review that ends `INCOMPLETE` (the review itself could not finish, nothing
+critical found) is posted as a COMMENTED review on the reviewed head; it never
+approves, requests changes or dismisses an earlier blocking review. Every
+posting short of an approval must carry a "To move this forward" section that
+names who acts next; the posting helper refuses it otherwise.
 
 Reviews are guarded by locks: interactive runs take a global lock, while
 scheduled runs overlap and take one lock per PR. A PR already being reviewed
@@ -248,6 +266,9 @@ Then point it at your setup (env vars, with these defaults):
 | `PRSMASH_NTFY_SERVER` | `https://ntfy.sh` | ntfy server to publish to |
 | `PRSMASH_NTFY_TOPIC` | `prsmash` | ntfy topic for review outcome notifications |
 | `PRSMASH_NTFY_TOKEN` | _(unset)_ | ntfy access token, required when the topic is reserved |
+| `PRSMASH_MAX_ACTIVITY_REREVIEWS` | `2` | Extra reviews of one head earned by people commenting after a review |
+| `PRSMASH_MERGEABLE_POLL_ATTEMPTS` | `4` | Reads of the PR while GitHub computes mergeability |
+| `PRSMASH_MERGEABLE_POLL_SECS` | `3` | Seconds between those reads |
 | `PRSMASH_NTFY_FAILURE_COOLDOWN_MINS` | `60` | Minimum minutes between failure notifications for the same PR |
 
 Confirm with:
@@ -314,7 +335,9 @@ systemctl --user enable --now prsmash-hourly.timer
 bin/prsmash                    the main script
 lib/review-queue.sh            builds the PR queue JSON (gh + jq)
 lib/review-outcome.sh          maps a finished review to its status and ntfy message
-lib/review-disposition-state.sh  exact heads already handled outside GitHub review state
+lib/review-disposition-state.sh  exact heads already handled, and when they earn another look
+lib/merge-conflicts.sh         mergeability check, trial merge and the conflict notice
+bin/prsmash-merge-check        print the conflict notice for a PR without posting it
 lib/review-timeout.sh          adaptive review timeouts
 tests/*.test.sh                bash tests with stubbed gh, pi and curl
 systemd/prsmash-hourly.*       half-hourly timer for prsmash --all
@@ -328,7 +351,8 @@ queue.json               the queue that was fetched
 pr-<N>-<repo>.log        full review log + our latest GitHub review body
 pr-<N>.status            machine-readable outcome: OK|<STATE>|<secs>, LOCKED, HANDLED or ERR
                          (STATE: APPROVED, CHANGES_REQUESTED, COMMENTED,
-                         MANUAL_APPROVAL_REQUIRED, INCOMPLETE, NOT_POSTED)
+                         MANUAL_APPROVAL_REQUIRED, INCOMPLETE, NOT_POSTED,
+                         CONFLICTING)
 sessions/pr-<N>/         pi session for the review
 summary.txt              reviewed/approved/errored counts
 ```

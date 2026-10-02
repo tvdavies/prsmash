@@ -26,6 +26,8 @@ source "$PRSMASH_LIB_DIR/review-disposition-state.sh"
 source "$PRSMASH_LIB_DIR/review-timeout.sh"
 # shellcheck source=../lib/review-outcome.sh
 source "$PRSMASH_LIB_DIR/review-outcome.sh"
+# shellcheck source=../lib/merge-conflicts.sh
+source "$PRSMASH_LIB_DIR/merge-conflicts.sh"
 PRSMASH_SOURCE_REPO="${PRSMASH_SOURCE_REPO:-$HOME/dev/lleverage-ai/lleverage}"
 SLACK_SCRIPT="${PRSMASH_SLACK_SCRIPT:-$HOME/.claude/skills/slack/scripts/slack.sh}"
 SLACK_APPROVAL_NOTIFY="${PRSMASH_SLACK_APPROVAL_NOTIFY:-true}"
@@ -879,6 +881,7 @@ manual_approval=0
 changes_requested=0
 incomplete=0
 not_posted=0
+conflicting=0
 errored=0
 # A PR already being reviewed by an overlapping run is a routine outcome now
 # that scheduled runs overlap, not a failure. Counting it separately keeps
@@ -887,7 +890,10 @@ skipped=0
 
 is_retryable() {
   local log_file=$1
-  grep -qE 'API Error: 5[0-9]{2}|overloaded_error|api_error|rate_limit|temporarily unavailable|service unavailable' "$log_file" 2>/dev/null
+  # "Failed to load extension": pi started while the agent-toolkit sync hook
+  # was reinstalling node_modules (run 20261002-102502). A retry after
+  # RETRY_DELAY finds the reinstall finished.
+  grep -qE 'API Error: 5[0-9]{2}|overloaded_error|api_error|rate_limit|temporarily unavailable|service unavailable|Failed to load extension' "$log_file" 2>/dev/null
 }
 
 prepare_pr_context() {
@@ -1049,6 +1055,63 @@ append_latest_review_body() {
   } >> "$log_file"
 }
 
+# handle_merge_conflict REPO PR PR_JSON AUTHOR MY_REVIEW_STATE LOG_FILE
+#
+# Called when GitHub says the PR conflicts with its base. Trial-merges the head
+# into the current base tip to name the conflicting files, then posts one
+# notice per head (deduplicated by a marker in our own comments, so a lost
+# disposition file cannot double-post). Returns non-zero only when posting
+# failed, in which case the head is not recorded and the next tick retries.
+handle_merge_conflict() {
+  local pr_repo=$1 pr_number=$2 pr_json=$3 pr_author=$4 my_state=$5 log_file=$6
+  local head base_ref base_tmp_ref head_tmp_ref base_commit conflicts="" behind="" body_file me
+
+  head=$(jq -r '.head.sha' <<<"$pr_json")
+  base_ref=$(jq -r '.base.ref // "main"' <<<"$pr_json")
+  [[ -n "$pr_author" && "$pr_author" != null ]] || pr_author=$(jq -r '.user.login // "author"' <<<"$pr_json")
+  base_tmp_ref="refs/prsmash/${RUN_ID}/base-${pr_number}"
+  head_tmp_ref="refs/prsmash/${RUN_ID}/pr-${pr_number}"
+
+  # GitHub's base.sha is often the old merge base; conflicts are computed
+  # against the base branch tip, so fetch that.
+  if git -C "$PRSMASH_SOURCE_REPO" fetch -q origin "+refs/heads/${base_ref}:${base_tmp_ref}" >/dev/null 2>&1 \
+      && git -C "$PRSMASH_SOURCE_REPO" fetch -q origin "+pull/${pr_number}/head:${head_tmp_ref}" >/dev/null 2>&1; then
+    base_commit=$(git -C "$PRSMASH_SOURCE_REPO" rev-parse "$base_tmp_ref" 2>/dev/null || true)
+    if [[ -n "$base_commit" ]] && git -C "$PRSMASH_SOURCE_REPO" cat-file -e "${head}^{commit}" 2>/dev/null; then
+      conflicts=$(merge_conflict_files "$PRSMASH_SOURCE_REPO" "$base_commit" "$head" "$base_ref" || true)
+      behind=$(git -C "$PRSMASH_SOURCE_REPO" rev-list --count "${head}..${base_commit}" 2>/dev/null || true)
+    fi
+  fi
+  [[ -n "${base_commit:-}" ]] || base_commit=$(jq -r '.base.sha // ""' <<<"$pr_json")
+
+  body_file="$RUN_DIR/tmp/pr-${pr_number}-merge-conflict.md"
+  mkdir -p "$RUN_DIR/tmp"
+  conflict_notice_body "$head" "$base_ref" "$base_commit" "$behind" "$pr_author" "$my_state" "$conflicts" > "$body_file"
+  {
+    echo "mergeState=CONFLICTING head=${head} base=${base_ref}@${base_commit}"
+    echo "conflictingFiles<<PRSMASH_FILES"
+    printf '%s\n' "$conflicts"
+    echo "PRSMASH_FILES"
+    echo "========== Merge-conflict notice =========="
+    cat "$body_file"
+    echo "========== End merge-conflict notice =========="
+  } >> "$log_file"
+
+  me=$(github_login 2>/dev/null || true)
+  if [[ -n "$me" ]] && conflict_notice_already_posted "$pr_repo" "$pr_number" "$head" "$me" \
+      "$(conflict_fingerprint "$conflicts")"; then
+    echo "Merge-conflict notice already posted for ${head} or for the same files; not posting again." >> "$log_file"
+    return 0
+  fi
+  if gh api --method POST "repos/${pr_repo}/issues/${pr_number}/comments" -F "body=@${body_file}" \
+      --jq '.html_url' >> "$log_file" 2>&1; then
+    echo "Posted merge-conflict notice." >> "$log_file"
+    return 0
+  fi
+  echo "Could not post the merge-conflict notice." >> "$log_file"
+  return 1
+}
+
 review_pr_bg() {
   local pr_number=$1
   local pr_repo=$2
@@ -1056,9 +1119,13 @@ review_pr_bg() {
   local status_file=$4
   local since_commit=$5
   local head_oid=$6
+  local my_review_state=${7:-}
+  local last_activity_at=${8:-}
+  local pr_author=${9:-}
   local start end duration attempt=1 latest_state lock_name disposition_source
   local result_file analyzed_head reviews_json started_at outcome
   local pr_meta changed_lines timeout_file timeout_count review_timeout review_rc
+  local decision activity_count=0 merge_state preamble=""
 
   lock_name=$(printf '%s-%s' "$pr_repo" "$pr_number" | tr '/:' '__')
   exec {pr_lock_fd}>"$LOG_ROOT/locks/pr-${lock_name}.lock"
@@ -1077,9 +1144,43 @@ review_pr_bg() {
     return 1
   fi
   head_oid=$(jq -r '.head.sha' <<<"$pr_meta")
-  if review_disposition_exists "$pr_repo" "$pr_number" "$head_oid"; then
+  decision=$(review_disposition_decision "$pr_repo" "$pr_number" "$head_oid" "$last_activity_at")
+  case "$decision" in
+    handled)
+      printf 'HANDLED||0\n' > "$status_file"
+      return 0 ;;
+    activity)
+      # Someone answered after our last look at this head (evidence, a
+      # decision, a reply). One more look, counted against a small cap.
+      activity_count=$(review_disposition_field "$pr_repo" "$pr_number" "$head_oid" activityRereviews || echo 0)
+      [[ "$activity_count" =~ ^[0-9]+$ ]] || activity_count=0
+      activity_count=$((activity_count + 1))
+      preamble+="activityRereview=${activity_count} lastActivityAt=${last_activity_at}"$'\n' ;;
+  esac
+  : > "$log_file"
+
+  # Mergeability first. A conflicting branch gets a short notice instead of a
+  # full review; a head we already noticed stays skipped while it conflicts and
+  # is reviewed once it merges cleanly.
+  pr_meta=$(refresh_pr_merge_state "$pr_repo" "$pr_number" "$pr_meta")
+  merge_state=$(pr_merge_state "$pr_meta")
+  preamble+="mergeState=${merge_state}"$'\n'
+  if [[ "$decision" == conflict && "$merge_state" != MERGEABLE ]]; then
+    # Still conflicting, or GitHub has not worked it out yet: the notice we
+    # posted for this head still stands. Look again next tick.
     printf 'HANDLED||0\n' > "$status_file"
     return 0
+  fi
+  if [[ "$merge_state" == CONFLICTING ]]; then
+    printf '%s' "$preamble" >> "$log_file"
+    if handle_merge_conflict "$pr_repo" "$pr_number" "$pr_meta" "$pr_author" "$my_review_state" "$log_file"; then
+      record_review_disposition "$pr_repo" "$pr_number" "$head_oid" merge-conflict \
+        || echo "Could not persist the merge-conflict disposition for ${pr_repo}#${pr_number}." >> "$log_file"
+      printf 'OK|CONFLICTING|0\n' > "$status_file"
+      return 0
+    fi
+    printf 'ERR||0\n' > "$status_file"
+    return 1
   fi
 
   if ! changed_lines=$(jq -er '
@@ -1099,7 +1200,7 @@ review_pr_bg() {
   started_at=$(date -u -d "@$start" +%Y-%m-%dT%H:%M:%SZ)
   while [[ $attempt -le $MAX_RETRIES ]]; do
     review_rc=0
-    run_pr_review "$pr_number" "$pr_repo" "$since_commit" "$review_timeout" > "$log_file" 2>&1 || review_rc=$?
+    { printf '%s' "$preamble"; run_pr_review "$pr_number" "$pr_repo" "$since_commit" "$review_timeout"; } > "$log_file" 2>&1 || review_rc=$?
     if [[ "$review_rc" -eq 0 ]]; then
       rm -f "$timeout_file"
       end=$(date +%s)
@@ -1119,11 +1220,15 @@ review_pr_bg() {
         "$reviews_json" "$user" "$started_at")
       IFS=$'\t' read -r latest_state disposition_source <<<"$outcome"
       echo "prsmashOutcome=${latest_state} head=${analyzed_head} disposition=${disposition_source:-none}" >> "$log_file"
-      # Record anything GitHub review state will not stop by itself, including
-      # an INCOMPLETE round and a run that published nothing, so later runs
-      # skip this head until a new commit arrives.
-      if [[ -n "$disposition_source" ]] \
-          && ! record_review_disposition "$pr_repo" "$pr_number" "$analyzed_head" "$disposition_source"; then
+      # Record every outcome against this head, including approvals and
+      # blocking reviews: an overlapping run whose queue was fetched before
+      # this review posted must not review the same head again (lleverage#7250
+      # got two identical CHANGES_REQUESTED reviews on 3b758135 four minutes
+      # apart). Later runs skip the head until a new commit arrives or someone
+      # comments after this review started.
+      if ! record_review_disposition "$pr_repo" "$pr_number" "$analyzed_head" \
+            "${disposition_source:-$(printf '%s' "$latest_state" | tr '[:upper:]_' '[:lower:]-')-review}" \
+            "$started_at" "$activity_count"; then
         echo "Could not persist the review disposition for ${pr_repo}#${pr_number} at ${analyzed_head}; this head may be reviewed again." >&2
       fi
       printf 'OK|%s|%d\n' "$latest_state" "$duration" > "$status_file"
@@ -1170,7 +1275,11 @@ for i in $(seq 0 $((pr_count - 1))); do
   status_file="$RUN_DIR/pr-${pr_number}.status"
   rm -f "$status_file"
 
-  review_pr_bg "$pr_number" "$pr_repo" "$log_file" "$status_file" "$since_commit" "$head_oid" &
+  my_review_state=$(echo "$queue_json" | jq -r ".prs[$i].myReviewState // empty")
+  last_activity_at=$(echo "$queue_json" | jq -r ".prs[$i].lastActivityAt // empty")
+
+  review_pr_bg "$pr_number" "$pr_repo" "$log_file" "$status_file" "$since_commit" "$head_oid" \
+    "$my_review_state" "$last_activity_at" "$pr_author" &
   pid=$!
   CHILD_PIDS+=("$pid")
   pid_info[$pid]="${pr_number}"$'\t'"${pr_title}"$'\t'"${pr_author}"$'\t'"${needs_rereview}"$'\t'"${log_file}"$'\t'"${status_file}"$'\t'"${pr_repo}"
@@ -1178,6 +1287,7 @@ for i in $(seq 0 $((pr_count - 1))); do
   tag=""
   [[ "$needs_rereview" == "true" ]] && tag=" ${YELLOW}[re-review]${RESET}"
   [[ "$queue_source" == "threads-resolved" ]] && tag=" ${YELLOW}[re-review: threads resolved]${RESET}"
+  [[ "$queue_source" == "suggestions-answered" ]] && tag=" ${YELLOW}[re-review: suggestions answered]${RESET}"
   [[ "$implicit_rereview" == "true" ]] && tag=" ${BLUE}[implicit re-review]${RESET}"
   echo -e "  ${DIM}started${RESET} #${pr_number} — ${pr_title} ${DIM}(${pr_author})${RESET}${tag}"
 done
@@ -1232,6 +1342,10 @@ while [[ $completed -lt $total ]]; do
       notify_pr_ntfy "$(ntfy_kind_for_state "$latest_state")" "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$time_str" || true
       changes_requested=$((changes_requested + 1))
       reviewed=$((reviewed + 1)) ;;
+    OK:CONFLICTING)
+      echo -e "${prefix} ${YELLOW}Merge conflicts${RESET} ${suffix} ${DIM}— posted the conflicting files; re-reviews once the branch merges cleanly${RESET}"
+      notify_pr_ntfy "$(ntfy_kind_for_state "$latest_state")" "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$time_str" || true
+      conflicting=$((conflicting + 1)) ;;
     OK:INCOMPLETE)
       echo -e "${prefix} ${YELLOW}Review incomplete${RESET} ${suffix} ${DIM}— commented, not approved; head recorded as handled${RESET}"
       notify_pr_ntfy "$(ntfy_kind_for_state "$latest_state")" "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$time_str" || true
@@ -1269,6 +1383,7 @@ awaiting_manual_approval=$manual_approval
 changes_requested=$changes_requested
 incomplete=$incomplete
 not_posted=$not_posted
+conflicting=$conflicting
 EOF
 
 cleanup_run_resources
@@ -1284,6 +1399,9 @@ if [[ "$manual_approval" -gt 0 ]]; then
 fi
 if [[ "$incomplete" -gt 0 ]]; then
   echo -e "  ${YELLOW}${incomplete} incomplete${RESET} ${DIM}— commented with the missing coverage; not approved${RESET}"
+fi
+if [[ "$conflicting" -gt 0 ]]; then
+  echo -e "  ${YELLOW}${conflicting} conflicting${RESET} ${DIM}— not reviewed; conflict notice posted, re-review once resolved${RESET}"
 fi
 if [[ "$not_posted" -gt 0 ]]; then
   echo -e "  ${YELLOW}${not_posted} not posted${RESET} ${DIM}— reviewer published nothing; check the logs${RESET}"
