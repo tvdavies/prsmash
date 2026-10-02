@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+#
+# prsmash-merge-check — show what prsmash would post on a conflicting PR.
+# Read-only on GitHub: it never posts. It fetches the base branch and the PR
+# head into temporary refs of PRSMASH_SOURCE_REPO and removes them afterwards.
+#
+# Usage:
+#   prsmash-merge-check [--repo OWNER/NAME] [--my-review-state STATE] PR_NUMBER
+#
+set -euo pipefail
+
+SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}")
+PRSMASH_LIB_DIR="${PRSMASH_LIB_DIR:-$(dirname "$SCRIPT_PATH")/../lib}"
+# shellcheck source=../lib/merge-conflicts.sh
+source "$PRSMASH_LIB_DIR/merge-conflicts.sh"
+PRSMASH_SOURCE_REPO="${PRSMASH_SOURCE_REPO:-$HOME/dev/lleverage-ai/lleverage}"
+
+repo=""
+my_state=""
+pr_number=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --repo) repo="${2:?--repo requires OWNER/NAME}"; shift 2 ;;
+    --my-review-state) my_state="${2:?--my-review-state requires a value}"; shift 2 ;;
+    -h|--help) sed -n '2,10p' "$SCRIPT_PATH"; exit 0 ;;
+    *) pr_number="$1"; shift ;;
+  esac
+done
+[[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "PR_NUMBER required" >&2; exit 1; }
+[[ -n "$repo" ]] || repo=$(git -C "$PRSMASH_SOURCE_REPO" remote get-url origin \
+  | sed -E 's#(git@github.com:|https://github.com/)##; s#\.git$##')
+
+pr_json=$(gh api "repos/${repo}/pulls/${pr_number}")
+pr_json=$(refresh_pr_merge_state "$repo" "$pr_number" "$pr_json")
+state=$(pr_merge_state "$pr_json")
+head=$(jq -r '.head.sha' <<<"$pr_json")
+base_ref=$(jq -r '.base.ref' <<<"$pr_json")
+author=$(jq -r '.user.login' <<<"$pr_json")
+echo "mergeState=${state} head=${head} base=${base_ref}" >&2
+if [[ "$state" != CONFLICTING ]]; then
+  echo "Not conflicting; prsmash would review this head normally." >&2
+  exit 0
+fi
+
+if [[ -z "$my_state" ]]; then
+  me=$(gh api user --jq .login 2>/dev/null || true)
+  my_state=$(gh api --paginate "repos/${repo}/pulls/${pr_number}/reviews" 2>/dev/null \
+    | jq -s -r --arg me "$me" '[.[] | .[] | select(.user.login == $me
+        and (.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED"))] | last | .state // ""' \
+    || true)
+fi
+
+ns="refs/prsmash/merge-check-$$"
+trap 'git -C "$PRSMASH_SOURCE_REPO" for-each-ref --format="%(refname)" "$ns" | while read -r r; do git -C "$PRSMASH_SOURCE_REPO" update-ref -d "$r"; done' EXIT
+git -C "$PRSMASH_SOURCE_REPO" fetch -q origin "+refs/heads/${base_ref}:${ns}/base" "+pull/${pr_number}/head:${ns}/head"
+base_commit=$(git -C "$PRSMASH_SOURCE_REPO" rev-parse "${ns}/base")
+conflicts=$(merge_conflict_files "$PRSMASH_SOURCE_REPO" "$base_commit" "$head" "$base_ref" || true)
+behind=$(git -C "$PRSMASH_SOURCE_REPO" rev-list --count "${head}..${base_commit}")
+conflict_notice_body "$head" "$base_ref" "$base_commit" "$behind" "$author" "$my_state" "$conflicts"

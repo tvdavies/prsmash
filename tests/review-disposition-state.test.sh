@@ -93,4 +93,32 @@ if record_review_disposition "$repo" "$pr" not-a-sha manual 2>/dev/null; then
   fail "invalid head was accepted"
 fi
 
+# What a recorded head means for the next tick.
+decision_root="$TMP/decision"
+review_disposition_state_init "$decision_root"
+[[ $(review_disposition_decision "$repo" "$pr" "$reviewed_head" "") == review ]] \
+  || fail "an unrecorded head was not reviewable"
+# Started 10:00 in +02:00, i.e. 08:00Z. Comparisons must be by instant, not text.
+record_review_disposition "$repo" "$pr" "$reviewed_head" approved-review "2026-10-02T10:00:00+02:00"
+[[ $(review_disposition_decision "$repo" "$pr" "$reviewed_head" "") == handled ]] \
+  || fail "no activity still re-reviewed"
+[[ $(review_disposition_decision "$repo" "$pr" "$reviewed_head" "2026-10-02T09:30:00Z") == activity ]] \
+  || fail "a comment after the review started (09:30Z > 08:00Z) did not earn a look"
+[[ $(review_disposition_decision "$repo" "$pr" "$reviewed_head" "2026-10-02T07:59:00Z") == handled ]] \
+  || fail "a comment from before the review re-reviewed it"
+record_review_disposition "$repo" "$pr" "$reviewed_head" approved-review "2026-10-02T08:00:00Z" 2
+[[ $(review_disposition_decision "$repo" "$pr" "$reviewed_head" "2026-10-02T09:30:00Z") == handled ]] \
+  || fail "activity re-reviews were not capped at two"
+[[ $(review_disposition_decision "$repo" "$pr" "$reviewed_head" "2026-10-02T09:30:00Z" 3) == activity ]] \
+  || fail "the cap is not configurable"
+record_review_disposition "$repo" "$pr" "$reviewed_head" merge-conflict
+[[ $(review_disposition_decision "$repo" "$pr" "$reviewed_head" "2026-10-02T09:30:00Z") == conflict ]] \
+  || fail "a merge-conflict head did not defer to mergeability"
+# Records written before startedAt existed fall back to reviewedAt.
+legacy=$(review_disposition_file "$repo" "$pr" "$new_head")
+jq -n --arg head "$new_head" '{repo:"lleverage-ai/lleverage",pr:5938,head:$head,source:"incomplete-review",
+  reviewedAt:"2026-10-02T10:37:00+02:00"}' > "$legacy"
+[[ $(review_disposition_decision "$repo" "$pr" "$new_head" "2026-10-02T08:40:00Z") == activity ]] \
+  || fail "legacy record did not use reviewedAt"
+
 echo "review-disposition-state tests passed"

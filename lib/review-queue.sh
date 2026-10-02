@@ -6,8 +6,12 @@ set -eo pipefail
 # Queue sources:
 #   review-request      — PRs where our review is explicitly requested
 #   threads-resolved    — PRs we previously blocked (CHANGES_REQUESTED/DISMISSED)
-#                         where the author has since resolved every non-CodeRabbit review thread
-#                         and either pushed new commits or replied after our review.
+#                         where the author has since resolved every non-CodeRabbit review
+#                         thread and either pushed new commits or replied after our review,
+#                         in a thread or a PR comment.
+#   suggestions-answered — PRs whose only review from us was non-blocking (COMMENTED, e.g.
+#                         "changes suggested") where the author has since pushed or replied.
+#                         Their threads need not be resolved: they never gated the merge.
 #                         Always included: the author has done everything GitHub
 #                         lets them do; waiting for an explicit re-request would
 #                         deadlock the PR.
@@ -103,9 +107,10 @@ echo "$prs" | jq -c '.[]' | while read -r pr; do
             nodes {
               isResolved
               origin: comments(first: 1) { nodes { author { login } } }
-              comments(last: 1) { nodes { author { login } createdAt } }
+              comments(last: 1) { nodes { author { login __typename } createdAt } }
             }
           }
+          comments(last: 30) { nodes { author { login __typename } createdAt } }
         }
       }
     }' -f owner="$owner" -f repo="$name" -F number="$number" 2>/dev/null || true)
@@ -116,6 +121,11 @@ echo "$prs" | jq -c '.[]' | while read -r pr; do
 
   review_info=$(echo "$raw" | jq --arg me "$REVIEW_USER" '
     def is_coderabbit: ascii_downcase | IN("coderabbitai", "coderabbitai[bot]");
+    # Bots (CodeRabbit, Linear, CI) comment on their own schedule; only people
+    # answering us count as new activity.
+    def is_person($me): (.author.login // "") as $l
+      | $l != "" and $l != $me and (.author.__typename // "User") != "Bot"
+        and ($l | test("\\[bot\\]$|^coderabbitai$|^linear(-code)?$"; "i") | not);
     .data.repository.pullRequest as $pr
     | ($pr.reviews.nodes | map(select(.author.login != null)) | sort_by(.submittedAt)) as $reviews
     | ($reviews | group_by(.author.login) | map(last)
@@ -141,7 +151,13 @@ echo "$prs" | jq -c '.[]' | while read -r pr; do
           | select(.isResolved | not)
           | select((.origin.nodes[0].author.login // "" | is_coderabbit) | not)] | length),
         last_other_thread_activity: ([$pr.reviewThreads.nodes[].comments.nodes[]
-                                       | select(.author.login != $me) | .createdAt] | max // null)
+                                       | select(.author.login != $me) | .createdAt] | max // null),
+        # Latest comment by a person other than us, in a thread or on the PR
+        # itself. Authors often answer a review (evidence, a decision) in a PR
+        # comment rather than a thread reply.
+        last_other_activity: ([($pr.reviewThreads.nodes[].comments.nodes[]),
+                               (($pr.comments.nodes // [])[])]
+                              | map(select(is_person($me)) | .createdAt) | max // null)
       }')
 
   decision=$(echo "$review_info" | jq \
@@ -149,7 +165,8 @@ echo "$prs" | jq -c '.[]' | while read -r pr; do
     --argjson implicit "$([ "$INCLUDE_IMPLICIT" = true ] && echo true || echo false)" '
     (.my_review.submittedAt) as $mine_at
     | (.last_commit != null and $mine_at != null and .last_commit > $mine_at) as $pushed_since
-    | (.last_other_thread_activity != null and $mine_at != null and .last_other_thread_activity > $mine_at) as $replied_since
+    | ([.last_other_thread_activity, .last_other_activity] | map(select(. != null)) | max // null) as $last_reply
+    | ($last_reply != null and $mine_at != null and $last_reply > $mine_at) as $replied_since
     | if $source == "review-request" then
         # Never reviewed: do not wait for CodeRabbit; other blocking reviewers
         # still hold the initial review. Already reviewed: only re-review
@@ -164,6 +181,12 @@ echo "$prs" | jq -c '.[]' | while read -r pr; do
            and .blocking_threads_unresolved == 0
            and ($pushed_since or $replied_since) then
         {include: true, source: "threads-resolved", implicitRereview: false}
+      elif .my_review.state == "COMMENTED" and ($pushed_since or $replied_since) then
+        # Our only verdict so far was non-blocking ("changes suggested"), so
+        # its threads do not gate anything. Once the author pushes or answers,
+        # give a real verdict instead of leaving the PR with none
+        # (lleverage#7325 got a push the day after and was never looked at).
+        {include: true, source: "suggestions-answered", implicitRereview: false}
       elif $implicit and .my_review.state != null and $pushed_since then
         {include: true, source: $source, implicitRereview: true}
       else
@@ -179,6 +202,7 @@ echo "$prs" | jq -c '.[]' | while read -r pr; do
       headRefOid: $info.head_oid,
       lastCommitAt: $info.last_commit,
       threadsUnresolved: $info.threads_unresolved,
+      lastActivityAt: $info.last_other_activity,
       needsRereview: ($info.my_review.state != null),
       implicitRereview: $decision.implicitRereview
     }'

@@ -83,7 +83,7 @@ run_prsmash() {
   env PATH="$TMP/bin:$PATH" HOME="$TMP" TEST_BASE="$BASE" TEST_HEAD="$HEAD" TEST_OLD_HEAD="$OLD_HEAD" \
     TEST_PI_MODE="$1" TEST_PI_LOG="$TMP/pi.log" TEST_CURL_LOG="$TMP/curl.log" \
     PRSMASH_QUEUE_SCRIPT="$TMP/queue.sh" PRSMASH_SOURCE_REPO="$TMP/source" \
-    PRSMASH_LOG_DIR="$TMP/logs" PRSMASH_SLACK_APPROVAL_NOTIFY=false \
+    PRSMASH_LOG_DIR="$TMP/logs" PRSMASH_SLACK_APPROVAL_NOTIFY=false PRSMASH_MERGEABLE_POLL_SECS=0 \
     PRSMASH_NTFY_NOTIFY=true PRSMASH_NTFY_SERVER=https://ntfy.invalid PRSMASH_NTFY_TOPIC=test \
     "$ROOT/bin/prsmash" --all > "$TMP/output" 2>&1 || { cat "$TMP/output" >&2; fail "prsmash failed"; }
 }

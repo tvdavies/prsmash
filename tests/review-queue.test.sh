@@ -90,4 +90,39 @@ jq -e --arg new "$new_head" '.prs[0].queueSource == "threads-resolved"
   and .prs[0].myReviewAt == "2026-09-30T13:00:00Z"' <<<"$result" >/dev/null \
   || { echo "INCOMPLETE head did not re-enter on push: $result" >&2; exit 1; }
 
+# Authors often answer a review in a PR comment, not a thread reply. A person's
+# comment after our review counts as a reply (with lastActivityAt exposed for
+# prsmash's per-head check); bot comments do not.
+answered=$(jq '.data.repository.pullRequest.comments.nodes = [
+  {author:{login:"bob",__typename:"User"},createdAt:"2026-09-30T11:45:00Z"}]' <<<"$unchanged")
+result=$(run_case 1 "[$pr]" '[]' "$answered")
+jq -e '.prs[0].lastActivityAt == "2026-09-30T11:45:00Z"' <<<"$result" >/dev/null \
+  || { echo "issue-comment reply was not exposed: $result" >&2; exit 1; }
+for bot in '{"login":"coderabbitai","__typename":"Bot"}' '{"login":"linear-code","__typename":"User"}' \
+    '{"login":"github-actions[bot]","__typename":"User"}' '{"login":"alice","__typename":"User"}'; do
+  botted=$(jq --argjson a "$bot" '.data.repository.pullRequest.comments.nodes = [
+    {author:$a,createdAt:"2026-09-30T11:45:00Z"}]' <<<"$unchanged")
+  run_case 0 "[$pr]" '[]' "$botted" >/dev/null
+done
+
+# A "changes suggested" round is only COMMENTED: once the author pushes or
+# answers, it re-enters for a real verdict instead of waiting forever for a
+# review request that never comes (lleverage#7325). Its own threads do not
+# need resolving first.
+suggested=$(jq --arg head "$reviewed_head" '.data.repository.pullRequest.reviews.nodes =
+  [{author:{login:"alice"},state:"COMMENTED",submittedAt:"2026-09-30T11:00:00Z",commit:{oid:$head}}]
+  | .data.repository.pullRequest.commits.nodes[0].commit.committedDate = "2026-09-30T10:00:00Z"' <<<"$base")
+run_case 0 '[]' "[$pr]" "$suggested" >/dev/null
+suggested_answered=$(jq '.data.repository.pullRequest.comments.nodes = [
+  {author:{login:"bob",__typename:"User"},createdAt:"2026-09-30T12:30:00Z"}]' <<<"$suggested")
+result=$(run_case 1 '[]' "[$pr]" "$suggested_answered")
+jq -e '.prs[0].queueSource == "suggestions-answered"' <<<"$result" >/dev/null \
+  || { echo "answered COMMENTED round did not re-enter: $result" >&2; exit 1; }
+suggested_pushed=$(jq '.data.repository.pullRequest.commits.nodes[0].commit.committedDate = "2026-09-30T12:00:00Z"
+  | .data.repository.pullRequest.reviewThreads.nodes = [{isResolved:false,
+      origin:{nodes:[{author:{login:"alice"}}]},comments:{nodes:[{author:{login:"alice",__typename:"User"},createdAt:"2026-09-30T11:00:00Z"}]}}]' <<<"$suggested")
+result=$(run_case 1 '[]' "[$pr]" "$suggested_pushed")
+jq -e '.prs[0].queueSource == "suggestions-answered"' <<<"$result" >/dev/null \
+  || { echo "pushed COMMENTED round with open suggestion threads did not re-enter: $result" >&2; exit 1; }
+
 echo "review queue tests passed"

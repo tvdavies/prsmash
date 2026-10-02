@@ -20,10 +20,21 @@ review_disposition_exists() {
   [[ -f "$file" ]]
 }
 
+# record_review_disposition REPO PR HEAD [SOURCE] [STARTED_AT] [ACTIVITY_REREVIEWS]
+#
+# STARTED_AT is when the review that produced this disposition began. Author
+# activity after that moment can earn the same head another look (see
+# review_disposition_decision); activity before it was already in front of the
+# reviewer. ACTIVITY_REREVIEWS counts how many of those extra looks this head
+# has had, so a bot that answers every review cannot loop us.
 record_review_disposition() {
   local repo=$1 pr_number=$2 head_oid=$3 source=${4:-automated-review}
-  local file tmp
+  local started_at=${5:-} activity_rereviews=${6:-0}
+  local file tmp now
   file=$(review_disposition_file "$repo" "$pr_number" "$head_oid") || return 1
+  [[ "$activity_rereviews" =~ ^[0-9]+$ ]] || activity_rereviews=0
+  now=$(date -Is)
+  [[ -n "$started_at" ]] || started_at=$now
   tmp=$(mktemp "${file}.tmp.XXXXXX") || return 1
 
   if jq -n \
@@ -31,13 +42,69 @@ record_review_disposition() {
       --argjson pr "$pr_number" \
       --arg head "$head_oid" \
       --arg source "$source" \
-      --arg reviewedAt "$(date -Is)" \
-      '{repo: $repo, pr: $pr, head: $head, source: $source, reviewedAt: $reviewedAt}' \
+      --arg reviewedAt "$now" \
+      --arg startedAt "$started_at" \
+      --argjson activityRereviews "$activity_rereviews" \
+      '{repo: $repo, pr: $pr, head: $head, source: $source, reviewedAt: $reviewedAt,
+        startedAt: $startedAt, activityRereviews: $activityRereviews}' \
       > "$tmp"; then
     mv "$tmp" "$file"
   else
     rm -f "$tmp"
     return 1
+  fi
+}
+
+review_disposition_field() {
+  local file
+  file=$(review_disposition_file "$1" "$2" "$3") || return 1
+  [[ -f "$file" ]] || return 1
+  jq -r --arg field "$4" '.[$field] // empty' "$file" 2>/dev/null
+}
+
+# ISO-8601 timestamp -> epoch seconds; nothing for an empty or unparseable value.
+iso_to_epoch() {
+  [[ -n "${1:-}" ]] || return 0
+  date -d "$1" +%s 2>/dev/null || true
+}
+
+# review_disposition_decision REPO PR HEAD LAST_ACTIVITY_AT [MAX_ACTIVITY_REREVIEWS]
+#
+# What to do with a head we may already have handled:
+#   review    no disposition: review it
+#   conflict  we posted a merge-conflict notice for it: the caller re-checks
+#             mergeability and reviews only once the branch merges cleanly
+#   activity  handled, but someone other than us commented after that review
+#             started (evidence, a decision, an answer): one more look
+#   handled   handled and nothing new: skip until a new commit arrives
+#
+# Activity re-reviews are capped per head (default 2) so an author-side bot
+# that replies to every review cannot recreate the review loop.
+review_disposition_decision() {
+  local repo=$1 pr_number=$2 head_oid=$3 last_activity_at=${4:-} max=${5:-${PRSMASH_MAX_ACTIVITY_REREVIEWS:-2}}
+  local file source started_at count activity_epoch started_epoch
+  file=$(review_disposition_file "$repo" "$pr_number" "$head_oid") || { echo review; return 0; }
+  [[ -f "$file" ]] || { echo review; return 0; }
+
+  source=$(jq -r '.source // empty' "$file" 2>/dev/null || true)
+  if [[ "$source" == merge-conflict ]]; then
+    echo conflict
+    return 0
+  fi
+
+  started_at=$(jq -r '.startedAt // .reviewedAt // empty' "$file" 2>/dev/null || true)
+  count=$(jq -r '.activityRereviews // 0' "$file" 2>/dev/null || echo 0)
+  [[ "$count" =~ ^[0-9]+$ ]] || count=0
+  [[ "$max" =~ ^[0-9]+$ ]] || max=2
+  activity_epoch=$(iso_to_epoch "$last_activity_at")
+  started_epoch=$(iso_to_epoch "$started_at")
+
+  if [[ -n "$activity_epoch" && -n "$started_epoch" ]] \
+      && [[ "$activity_epoch" -gt "$started_epoch" ]] \
+      && [[ "$count" -lt "$max" ]]; then
+    echo activity
+  else
+    echo handled
   fi
 }
 
@@ -54,8 +121,11 @@ filter_review_dispositions() {
     head_oid=$(jq -r '.headRefOid // empty' <<<"$item")
 
     if [[ -n "$repo" && -n "$pr_number" && -n "$head_oid" ]] \
-        && review_disposition_exists "$repo" "$pr_number" "$head_oid"; then
-      printf 'Skipping #%s (%s): this exact head already completed an automated review outside GitHub review state.\n' \
+        && [[ $(review_disposition_decision "$repo" "$pr_number" "$head_oid" \
+               "$(jq -r '.lastActivityAt // empty' <<<"$item")") == handled ]]; then
+      # A merge-conflict head stays listed: review_pr_bg re-checks
+      # mergeability and reviews it once the conflicts are gone.
+      printf 'Skipping #%s (%s): prsmash already handled this exact head and nobody has commented since.\n' \
         "$pr_number" "$repo" >&2
       continue
     fi

@@ -79,11 +79,16 @@ chmod +x "$TMP/queue.sh" "$TMP/bin/gh" "$TMP/bin/pi" "$TMP/bin/timeout"
 
 run_review() {
   local expected=$1 lines=$2 exit_code=$3
+  # Every completed review now records its head as handled, approvals
+  # included. This test re-runs one head on purpose to exercise the timeout
+  # budget, so it starts each run without those records (the timeout state
+  # lives separately, in review-timeouts/).
+  rm -rf "$TMP/logs/review-dispositions"
   env PATH="$TMP/bin:$PATH" TEST_BASE="$BASE" TEST_HEAD="$HEAD" TEST_LINES="$lines" \
     TEST_SINCE="${TEST_SINCE:-}" \
     TEST_PI_EXIT="$exit_code" TEST_TIMEOUT_CAPTURE="$TMP/timeout" TEST_PI_CAPTURE="$TMP/pi" \
     PRSMASH_QUEUE_SCRIPT="$TMP/queue.sh" PRSMASH_SOURCE_REPO="$TMP/source" \
-    PRSMASH_LOG_DIR="$TMP/logs" PRSMASH_NTFY_NOTIFY=false PRSMASH_SLACK_APPROVAL_NOTIFY=false \
+    PRSMASH_LOG_DIR="$TMP/logs" PRSMASH_NTFY_NOTIFY=false PRSMASH_SLACK_APPROVAL_NOTIFY=false PRSMASH_MERGEABLE_POLL_SECS=0 \
     PRSMASH_REVIEW_TIMEOUT=2700 PRSMASH_MAX_REVIEW_TIMEOUT=7200 PRSMASH_LARGE_PR_LINES=1001 \
     "$ROOT/bin/prsmash" --all > "$TMP/output" 2>&1 || {
       cat "$TMP/output" >&2
