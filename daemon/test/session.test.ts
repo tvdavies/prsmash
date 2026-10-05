@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, renameSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync, existsSync, renameSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -169,4 +169,51 @@ test("a stale notification for a head already covered is ignored", async () => {
   git(fx.author, "push", "-q", fx.origin, "HEAD:refs/pull/1/head");
   control(fx, next);
   assert.equal(await session.done, 0);
+});
+
+test("a steer that reaches pi as it settles is reclaimed and sent as a prompt", async () => {
+  const fx = fixture();
+  const session = run(fx, "late-steer", { PRSMASH_SESSION_GRACE_SECONDS: "1" });
+  await sleep(300);
+  const next = commit(fx.author, "b.txt", "late\n", "racing push");
+  git(fx.author, "push", "-q", fx.origin, "HEAD:refs/pull/1/head");
+  control(fx, next);
+  assert.equal(await session.done, 0);
+  const types = session.commands().map((c) => c.type);
+  assert.deepEqual(types, ["prompt", "steer", "clear_queue", "prompt"]);
+  assert.match(session.commands()[3].message!, /moved while you were reviewing/);
+  assert.match(session.out(), /reclaimed/);
+});
+
+test("a fetch failure leaves the control message for a retry", async () => {
+  const fx = fixture();
+  const session = run(fx, "steer", { PRSMASH_SESSION_GRACE_SECONDS: "0.2", PRSMASH_CONTROL_RETRY_SECONDS: "0.3" });
+  await sleep(300);
+  const next = commit(fx.author, "b.txt", "x\n", "pushed while origin is unreachable");
+  const realOrigin = fx.origin;
+  git(fx.worktree, "remote", "set-url", "origin", join(fx.root, "missing.git"));
+  control(fx, next);
+  await sleep(800);
+  assert.ok(!session.commands().some((c) => c.type === "steer"), "nothing to steer while the fetch fails");
+  assert.equal(readdirSync(fx.control).filter((f) => f.endsWith(".json")).length, 1, "the message waits for a retry");
+  git(fx.author, "push", "-q", realOrigin, "HEAD:refs/pull/1/head");
+  git(fx.worktree, "remote", "set-url", "origin", realOrigin);
+  assert.equal(await session.done, 0);
+  assert.ok(session.commands().some((c) => c.type === "steer"));
+});
+
+test("a delta whose patch is bigger than an in-memory buffer is streamed to disk and steered", async () => {
+  const fx = fixture();
+  const session = run(fx, "steer");
+  await sleep(300);
+  // One 3 MiB line: a tiny line count, but over execFileSync's default buffer.
+  writeFileSync(join(fx.author, "huge.txt"), "x".repeat(3 * 1024 * 1024) + "\n");
+  git(fx.author, "add", "huge.txt");
+  git(fx.author, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "huge single line");
+  const next = git(fx.author, "rev-parse", "HEAD");
+  git(fx.author, "push", "-q", fx.origin, "HEAD:refs/pull/1/head");
+  control(fx, next);
+  assert.equal(await session.done, 0, session.err());
+  assert.ok(session.commands().some((c) => c.type === "steer"));
+  assert.ok(existsSync(join(fx.tmp, `delta-${fx.head.slice(0, 12)}-${next.slice(0, 12)}.diff`)));
 });

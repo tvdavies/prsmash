@@ -75,11 +75,14 @@ review_run_outcome() {
     COMMENTED) printf 'COMMENTED\tcommented-review\n' ;;
     *)
       # Non-blocking verdicts are posted as an issue comment, which has no
-      # review state. A comment of ours made during this run is that review
-      # (lleverage#7734 was reported unposted after posting one).
-      commented=$(jq -r --arg me "$login" --arg since "$started_at" '
+      # review state (lleverage#7734 was reported unposted after posting one).
+      # Only a comment of ours from this run carrying the posting helper's
+      # marker for this exact head counts; any other comment proves nothing.
+      commented=$(jq -r --arg me "$login" --arg since "$started_at" \
+          --arg marker "<!-- pr-review reviewed-head=${head_oid} -->" '
           (if length > 0 and (.[0] | type) == "array" then add else . end)
-          | [.[] | select(.user.login == $me and (.created_at // "") >= $since)]
+          | [.[] | select(.user.login == $me and (.created_at // "") >= $since
+                          and ((.body // "") | contains($marker)))]
           | length' <<<"${issue_comments_json:-[]}" 2>/dev/null || echo 0)
       if [[ "$commented" =~ ^[0-9]+$ && "$commented" -gt 0 ]]; then
         printf 'COMMENTED\tissue-comment-review\n'

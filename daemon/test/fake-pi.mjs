@@ -6,6 +6,8 @@
 //   error     settle with an errored final message
 //   abortable keep running until aborted
 //   followup  settle at once; answer a later prompt and settle again
+//   late-steer settle just as a steer arrives, leaving it queued (as real pi
+//             does for an idle session); answer the reclaiming prompt
 import { appendFileSync } from "node:fs";
 
 const mode = process.env.FAKE_PI_MODE || "quick";
@@ -19,6 +21,7 @@ const settle = () => {
 };
 
 let prompts = 0;
+let queuedSteering = [];
 let buffer = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
@@ -41,7 +44,10 @@ function handle(command) {
       prompts += 1;
       emit({ type: "response", id: command.id, command: "prompt", success: true, data: { disposition: "started" } });
       emit({ type: "agent_start" });
-      if (mode === "quick" || (mode === "followup" && prompts === 1)) {
+      if (mode === "late-steer" && prompts > 1) {
+        say(`reclaimed: ${command.message.split("\n")[0]}`);
+        settle();
+      } else if (mode === "quick" || (mode === "followup" && prompts === 1)) {
         say("quick review done");
         settle();
       } else if (mode === "followup") {
@@ -54,6 +60,11 @@ function handle(command) {
       break;
     }
     case "steer":
+      if (mode === "late-steer") {
+        say("finished on the old head");
+        settle();
+        queuedSteering.push(command.message);
+      }
       emit({ type: "response", id: command.id, command: "steer", success: true, data: { disposition: "queued" } });
       if (mode === "steer") {
         setTimeout(() => {
@@ -66,6 +77,10 @@ function handle(command) {
       say("", { stopReason: "aborted" });
       settle();
       emit({ type: "response", id: command.id, command: "abort", success: true });
+      break;
+    case "clear_queue":
+      emit({ type: "response", id: command.id, command: "clear_queue", success: true, data: { steering: queuedSteering, followUp: [] } });
+      queuedSteering = [];
       break;
     case "extension_ui_response":
       break;

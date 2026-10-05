@@ -70,7 +70,12 @@ function note(message: string): void {
 }
 
 function git(...args: string[]): string {
-  return execFileSync("git", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  return execFileSync("git", args, {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 120_000,
+    maxBuffer: 16 * 1024 * 1024,
+  }).trim();
 }
 
 function readExpectedHead(): string {
@@ -106,16 +111,29 @@ let running = false;
 let settledAt = 0;
 let lastAssistant: AssistantMessage | undefined;
 let steers = 0;
+// A steer sent since pi last went idle. pi queues a steer that reaches an idle
+// session without starting a run, so after every settle these are reclaimed
+// (clear_queue) and re-sent as a prompt.
+let steerUnconfirmed = false;
 let finishing = false;
 const startedAt = Date.now();
 let deadline = startedAt + baseTimeoutMs;
 const hardDeadline = startedAt + maxTimeoutMs;
 const pending = new Map<string, (record: Record<string, unknown>) => void>();
 
-function send(command: Record<string, unknown>): Promise<Record<string, unknown>> {
+// Every RPC request is bounded: a pi that stops answering must not hold the
+// session past its deadline. A timeout resolves as a failed response.
+function send(command: Record<string, unknown>, timeoutMs = 120_000): Promise<Record<string, unknown>> {
   const id = `prsmash-${++requestId}`;
   return new Promise((resolve) => {
-    pending.set(id, resolve);
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      resolve({ type: "response", id, success: false, error: `no response to ${String(command.type)} after ${timeoutMs / 1000}s` });
+    }, timeoutMs);
+    pending.set(id, (record) => {
+      clearTimeout(timer);
+      resolve(record);
+    });
     pi.stdin!.write(`${JSON.stringify({ ...command, id })}\n`);
   });
 }
@@ -197,49 +215,62 @@ const piExited = new Promise<number>((resolve) => {
 
 type ControlMessage = { type: "head-moved"; head: string };
 
-function takeControlMessages(): ControlMessage[] {
+const controlRetryMs = seconds(env.PRSMASH_CONTROL_RETRY_SECONDS, 10) * 1000;
+const controlGiveUpMs = seconds(env.PRSMASH_CONTROL_GIVE_UP_SECONDS, 300) * 1000;
+const controlFailures = new Map<string, { first: number; last: number }>();
+
+// Control files stay on disk until handled, so a transient failure (a fetch
+// that times out) is retried on the next poll rather than lost.
+function controlMessages(): Array<{ path: string; message: ControlMessage | undefined }> {
   if (!controlDir || !existsSync(controlDir)) return [];
-  const messages: ControlMessage[] = [];
-  for (const name of readdirSync(controlDir).filter((n) => n.endsWith(".json")).sort()) {
-    const path = join(controlDir, name);
-    try {
-      messages.push(JSON.parse(readFileSync(path, "utf8")) as ControlMessage);
-    } catch (error) {
-      note(`ignoring unreadable control message ${name}: ${(error as Error).message}`);
-    }
-    rmSync(path, { force: true });
-  }
-  return messages;
+  const now = Date.now();
+  return readdirSync(controlDir)
+    .filter((n) => n.endsWith(".json"))
+    .sort()
+    .filter((name) => {
+      const failed = controlFailures.get(join(controlDir, name));
+      return !failed || now - failed.last >= controlRetryMs;
+    })
+    .map((name) => {
+      const path = join(controlDir, name);
+      try {
+        return { path, message: JSON.parse(readFileSync(path, "utf8")) as ControlMessage };
+      } catch (error) {
+        note(`ignoring unreadable control message ${name}: ${(error as Error).message}`);
+        return { path, message: undefined };
+      }
+    });
 }
 
 type Delta = { from: string; to: string; files: string[]; lines: number; commits: string; diffPath: string };
+type Move = Delta | { superseded: string } | "nothing" | "retry";
 
 // Fetch the PR's current head and describe what changed since the head under
-// review. Returns undefined when there is nothing new to say.
-function describeMove(requested: string): Delta | "superseded" | undefined {
+// review. The size limit is checked before the patch is written, so an
+// enormous delta supersedes the review instead of overflowing a buffer.
+function describeMove(requested: string): Move {
   const from = readExpectedHead() || git("rev-parse", "HEAD");
-  if (requested === from) return undefined;
+  if (requested === from) return "nothing";
   try {
     git("fetch", "-q", "origin", `+pull/${prNumber}/head`);
   } catch (error) {
     note(`could not fetch PR head: ${(error as Error).message}`);
-    return undefined;
+    return "retry";
   }
   const to = git("rev-parse", "FETCH_HEAD");
-  if (to === from) return undefined;
+  if (to === from) return "nothing";
   if (to !== requested) note(`asked to move to ${requested}, GitHub now has ${to}; using ${to}`);
   try {
     // A head we already cover (an older notification arriving late).
     git("merge-base", "--is-ancestor", to, from);
-    return undefined;
+    return "nothing";
   } catch {
     // not an ancestor: genuinely new
   }
   try {
     git("merge-base", "--is-ancestor", from, to);
   } catch {
-    note(`${to} does not contain ${from} (force-push or rebase)`);
-    return "superseded";
+    return { superseded: `${to} does not contain ${from} (force-push or rebase)` };
   }
   const numstat = git("diff", "--numstat", from, to);
   const files: string[] = [];
@@ -249,9 +280,10 @@ function describeMove(requested: string): Delta | "superseded" | undefined {
     files.push(path.join("\t"));
     lines += (Number(added) || 0) + (Number(deleted) || 0);
   }
+  if (lines > steerMaxLines) return { superseded: `delta of ${lines} lines exceeds ${steerMaxLines}` };
   const diffPath = join(tmpDir, `delta-${from.slice(0, 12)}-${to.slice(0, 12)}.diff`);
   mkdirSync(tmpDir, { recursive: true });
-  writeFileSync(diffPath, git("diff", from, to));
+  git("diff", `--output=${diffPath}`, from, to);
   const commits = git("log", "--format=- %h %s", `${from}..${to}`);
   return { from, to, files, lines, commits, diffPath };
 }
@@ -284,18 +316,31 @@ async function supersede(reason: string): Promise<void> {
   if (superseded) return;
   superseded = true;
   process.stdout.write(`PRSMASH_SUPERSEDED: ${reason}\n`);
-  await Promise.race([send({ type: "abort" }), sleep(60_000)]);
+  await send({ type: "abort" }, 60_000);
 }
 
 async function handleControl(): Promise<void> {
-  for (const message of takeControlMessages()) {
-    if (superseded || message.type !== "head-moved" || !/^[0-9a-f]{40}$/.test(message.head ?? "")) continue;
-    const delta = describeMove(message.head);
-    if (delta === undefined) continue;
-    if (delta === "superseded") return supersede("head was force-pushed or rebased");
+  for (const { path, message } of controlMessages()) {
+    if (superseded) return;
+    const valid = message?.type === "head-moved" && /^[0-9a-f]{40}$/.test(message.head ?? "");
+    const move = valid ? describeMove(message!.head) : "nothing";
+    if (move === "retry") {
+      const now = Date.now();
+      const failed = controlFailures.get(path) ?? { first: now, last: now };
+      controlFailures.set(path, { first: failed.first, last: now });
+      if (now - failed.first < controlGiveUpMs) continue;
+      note(`giving up on ${path} after ${Math.round((now - failed.first) / 1000)}s of failures`);
+    }
+    rmSync(path, { force: true });
+    controlFailures.delete(path);
+    if (move === "nothing" || move === "retry") continue;
+    if ("superseded" in move) return supersede(move.superseded);
     if (steers >= maxSteers) return supersede(`head moved more than ${maxSteers} times`);
-    if (delta.lines > steerMaxLines) return supersede(`delta of ${delta.lines} lines exceeds ${steerMaxLines}`);
+    const delta = move;
 
+    // The helper only accepts this head when the reviewer names it with
+    // --expected-head, so moving the file early cannot let a reviewer still
+    // finishing the old head publish against the new one.
     writeExpectedHead(delta.to);
     steers += 1;
     deadline = Math.min(hardDeadline, deadline + Math.max(600_000, baseTimeoutMs / 3));
@@ -306,11 +351,29 @@ async function handleControl(): Promise<void> {
     // Mark the follow-up as running before sending: its agent_settled can be
     // processed before this response resolves.
     if (followUp) running = true;
+    else steerUnconfirmed = true;
     const response = await send(command);
     if (response.success !== true) {
       note(`${command.type} rejected: ${String(response.error)}`);
       if (followUp) running = false;
     }
+  }
+}
+
+// After pi goes idle, a steer that arrived as it settled sits in its queue
+// and would never run. Take it back and send it as a prompt.
+async function reclaimQueuedSteers(): Promise<void> {
+  if (!steerUnconfirmed) return;
+  steerUnconfirmed = false;
+  const cleared = await send({ type: "clear_queue" });
+  const queued = ((cleared.data as { steering?: string[] } | undefined)?.steering ?? []).filter(Boolean);
+  if (cleared.success !== true || queued.length === 0) return;
+  note(`a steer reached pi as it settled; sending it as a follow-up`);
+  running = true;
+  const response = await send({ type: "prompt", message: queued.join("\n\n") });
+  if (response.success !== true) {
+    note(`follow-up rejected: ${String(response.error)}`);
+    running = false;
   }
 }
 
@@ -353,6 +416,20 @@ for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
   });
 }
 
+// The deadline is enforced on its own timer, so an awaited RPC call or a
+// blocked control step cannot hold the session past it.
+let timingOut = false;
+const watchdog = setInterval(() => {
+  if (timingOut || finishing || Date.now() <= Math.min(deadline, hardDeadline)) return;
+  timingOut = true;
+  process.stdout.write(`PRSMASH_REVIEW_TIMEOUT: no result after ${Math.round((Date.now() - startedAt) / 1000)}s\n`);
+  void send({ type: "abort" }, 30_000).then(() => {
+    killPi("SIGTERM");
+    return shutdown(EXIT_TIMEOUT);
+  });
+}, 1_000);
+watchdog.unref();
+
 async function main(): Promise<void> {
   const accepted = await Promise.race([send({ type: "prompt", message: opts.prompt }), piExited.then(() => undefined)]);
   if (accepted === undefined) fail("pi exited before accepting the prompt");
@@ -367,16 +444,13 @@ async function main(): Promise<void> {
 
   while (true) {
     await sleep(pollMs);
+    if (timingOut) return;
     if (piGone) break;
-    if (Date.now() > Math.min(deadline, hardDeadline)) {
-      process.stdout.write(`PRSMASH_REVIEW_TIMEOUT: no result after ${Math.round((Date.now() - startedAt) / 1000)}s\n`);
-      await Promise.race([send({ type: "abort" }), sleep(30_000)]);
-      killPi("SIGTERM");
-      await shutdown(EXIT_TIMEOUT);
-    }
     if (!superseded) await handleControl();
     if (superseded && !running) break;
     if (running || superseded) continue;
+    await reclaimQueuedSteers();
+    if (running) continue;
     // Settled. Unless the review is already published for the current head,
     // linger briefly: a push that lands as the reviewer finishes (often the
     // reason publication was refused) is cheaper to cover in this session
@@ -404,4 +478,8 @@ async function main(): Promise<void> {
   await shutdown(0);
 }
 
-void main();
+main().catch(async (error: unknown) => {
+  note(`session failed: ${(error as Error).stack ?? String(error)}`);
+  killPi("SIGTERM");
+  await shutdown(1);
+});

@@ -345,12 +345,21 @@ log_field() {
   grep -m1 "^${name}=" "$log_file" 2>/dev/null | cut -d= -f2- || true
 }
 
+# The head a review ended on: a steered review starts at headRefOid and is
+# moved forward, and review_pr_bg logs where it finished as reviewedHead.
+reviewed_head_from_log() {
+  local log_file=$1 head
+  head=$(log_field "$log_file" reviewedHead)
+  [[ -n "$head" ]] || head=$(log_field "$log_file" headRefOid)
+  printf '%s' "$head"
+}
+
 approval_line_summary() {
   local log_file=$1
   local changed additions deletions base_oid head_oid worktree shortstat files
 
   base_oid=$(log_field "$log_file" baseRefOid)
-  head_oid=$(log_field "$log_file" headRefOid)
+  head_oid=$(reviewed_head_from_log "$log_file")
   worktree=$(log_field "$log_file" worktree)
   if [[ -n "$base_oid" && -n "$head_oid" && -n "$worktree" && -d "$worktree" ]]; then
     shortstat=$(git -C "$worktree" diff --shortstat "${base_oid}...${head_oid}" 2>/dev/null || true)
@@ -466,7 +475,7 @@ notify_approval_slack() {
 
   slack_available "notification" || return 0
 
-  head_oid=$(log_field "$log_file" headRefOid)
+  head_oid=$(reviewed_head_from_log "$log_file")
   safe_key=$(printf '%s-%s-%s-%s' "$kind" "$pr_repo" "$pr_number" "${head_oid:-unknown-head}" | tr '/:' '__')
   marker_dir="$LOG_ROOT/approval-notifications"
   marker_file="$marker_dir/${safe_key}.sent"
@@ -1172,7 +1181,10 @@ review_pr_bg() {
 
   lock_name=$(printf '%s-%s' "$pr_repo" "$pr_number" | tr '/:' '__')
   exec {pr_lock_fd}>"$LOG_ROOT/locks/pr-${lock_name}.lock"
-  if ! flock -n "$pr_lock_fd"; then
+  # Wait briefly rather than not at all: prsmashd probes these locks to see
+  # which PRs are in review, and a probe's momentary hold must not turn a
+  # launch into LOCKED. A real review holds the lock far longer than this.
+  if ! flock -w 3 "$pr_lock_fd"; then
     printf 'LOCKED||0\n' > "$status_file"
     return 0
   fi
@@ -1275,6 +1287,7 @@ review_pr_bg() {
         "$reviews_json" "$user" "$started_at" "$issue_comments_json")
       IFS=$'\t' read -r latest_state disposition_source <<<"$outcome"
       echo "prsmashOutcome=${latest_state} head=${analyzed_head} disposition=${disposition_source:-none}" >> "$log_file"
+      echo "reviewedHead=${analyzed_head}" >> "$log_file"
       # Record every outcome against this head, including approvals and
       # blocking reviews: an overlapping run whose queue was fetched before
       # this review posted must not review the same head again (lleverage#7250

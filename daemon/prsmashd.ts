@@ -130,7 +130,7 @@ type QueueResult = { repo: string; user: string; prs: QueueEntry[] };
 
 const known = new Map<number, PrState>();
 const waiting = new Map<number, QueueEntry>(); // eligible, not yet started; insertion order = FIFO
-const children = new Map<number, { child: ChildProcess; head: string; queueFile: string }>();
+const children = new Map<number, { child: ChildProcess; queueFile: string }>();
 // Reviews still running from before this daemon started, found by their locks.
 const orphans = new Set<number>();
 const recheck = new Set<number>();
@@ -186,8 +186,6 @@ const sink: EventSink = {
         } else {
           log(`#${pr.number} moved to ${pr.head.slice(0, 12)} mid-review; steering`);
           writeControl(pr.number, { type: "head-moved", head: pr.head });
-          const running = children.get(pr.number);
-          if (running) running.head = pr.head;
         }
         continue;
       }
@@ -333,12 +331,21 @@ function start(entry: QueueEntry): void {
   const reviewEnv: Record<string, string | undefined> = { ...env, PRSMASH_ALLOW_CONCURRENT: "1", PRSMASH_CONTROL_DIR: controlDir(pr) };
   const prsmashArgs = ["--all", "--queue-file", queueFile];
   let child: ChildProcess;
+  let envFile = "";
   if (config.launcher === "systemd-run") {
     writeFileSync(outFile, "");
     const unit = `prsmash-run-pr${pr}-${new Date().toISOString().replace(/\D/g, "").slice(0, 14)}`;
-    const setenv = Object.entries(reviewEnv)
+    // Tokens must not sit in this command line for the hours a review runs
+    // (any local user can read argv). They go in a private file that the
+    // unit sources and deletes before starting prsmash.
+    const envDir = join(config.logRoot, "daemon", "env");
+    mkdirSync(envDir, { recursive: true, mode: 0o700 });
+    envFile = join(envDir, `${unit}.env`);
+    const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
+    const lines = Object.entries(reviewEnv)
       .filter(([key, value]) => value !== undefined && FORWARDED_ENV.test(key))
-      .map(([key, value]) => `--setenv=${key}=${value}`);
+      .map(([key, value]) => `${key}=${quote(value!)}`);
+    writeFileSync(envFile, `${lines.join("\n")}\n`, { mode: 0o600 });
     child = spawn(
       "systemd-run",
       [
@@ -349,7 +356,7 @@ function start(entry: QueueEntry): void {
         `--property=RuntimeMaxSec=${config.runtimeMaxSeconds}`,
         `--property=StandardOutput=append:${outFile}`,
         `--property=StandardError=append:${outFile}`,
-        ...setenv,
+        "/bin/bash", "-c", 'set -a; . "$0"; set +a; rm -f -- "$0"; exec "$@"', envFile,
         config.prsmash, ...prsmashArgs,
       ],
       { stdio: "ignore", detached: true },
@@ -360,7 +367,7 @@ function start(entry: QueueEntry): void {
     closeSync(out);
   }
   const head = entry.headRefOid ?? known.get(pr)?.head ?? "";
-  children.set(pr, { child, head, queueFile });
+  children.set(pr, { child, queueFile });
   log(`#${pr} review started at ${head.slice(0, 12)} (${children.size} running)`);
 
   child.on("exit", (code) => {
@@ -373,15 +380,15 @@ function start(entry: QueueEntry): void {
     } catch {
       // no output
     }
-    const finished = children.get(pr);
     children.delete(pr);
     rmSync(queueFile, { force: true });
+    if (envFile) rmSync(envFile, { force: true });
     clearControl(pr);
     log(`#${pr} review process exited (${code})`);
-    // The head may have moved after the reviewer stopped listening, or the
-    // review was superseded. Either way the new head needs a look.
-    const now = known.get(pr);
-    if (now && finished && now.head !== finished.head) recheck.add(pr);
+    // Always look again: the head may have moved after the reviewer stopped
+    // listening, the review may have been superseded, or a control message
+    // may have gone unread. The queue and dispositions decide what happens.
+    if (known.has(pr)) recheck.add(pr);
     schedule();
   });
 }

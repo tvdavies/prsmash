@@ -128,12 +128,20 @@ ntfy_message_body conflicting "Title" alice 0m0s | grep -q 're-review once resol
 # missing (lleverage#7734: the reviewer pointed the helper elsewhere). Our
 # comment from during the run is the review; an older one is not.
 rm -f "$result"
-comments=$(jq -nc --arg at "2026-10-02T07:15:00Z" '[[{user:{login:"tvdavies"},created_at:$at,body:"review"}]]')
+comments=$(jq -nc --arg at "2026-10-02T07:15:00Z" --arg head "$head" \
+  '[[{user:{login:"tvdavies"},created_at:$at,body:("review\n\n<!-- pr-review reviewed-head=" + $head + " -->")}]]')
 IFS=$'\t' read -r state source <<<"$(review_run_outcome "$result" "$repo" "$pr" "$head" '[]' tvdavies "$started" "$comments")"
 [[ "$state|$source" == "COMMENTED|issue-comment-review" ]] || fail "issue comment during the run: $state|$source"
 old_comment=$(jq -nc '[[{user:{login:"tvdavies"},created_at:"2026-10-01T07:15:00Z"}]]')
 IFS=$'\t' read -r state source <<<"$(review_run_outcome "$result" "$repo" "$pr" "$head" '[]' tvdavies "$started" "$old_comment")"
 [[ "$state" == NOT_POSTED ]] || fail "an issue comment from before the run counted: $state"
+unmarked=$(jq -nc '[[{user:{login:"tvdavies"},created_at:"2026-10-02T07:15:00Z",body:"an unrelated comment"}]]')
+IFS=$'\t' read -r state source <<<"$(review_run_outcome "$result" "$repo" "$pr" "$head" '[]' tvdavies "$started" "$unmarked")"
+[[ "$state" == NOT_POSTED ]] || fail "an unmarked comment of ours counted as a review: $state"
+other_head=$(jq -nc --arg old "$old_head" \
+  '[[{user:{login:"tvdavies"},created_at:"2026-10-02T07:15:00Z",body:("review\n<!-- pr-review reviewed-head=" + $old + " -->")}]]')
+IFS=$'\t' read -r state source <<<"$(review_run_outcome "$result" "$repo" "$pr" "$head" '[]' tvdavies "$started" "$other_head")"
+[[ "$state" == NOT_POSTED ]] || fail "a review comment for another head counted: $state"
 someone_else=$(jq -nc '[[{user:{login:"bob"},created_at:"2026-10-02T07:15:00Z"}]]')
 IFS=$'\t' read -r state source <<<"$(review_run_outcome "$result" "$repo" "$pr" "$head" '[]' tvdavies "$started" "$someone_else")"
 [[ "$state" == NOT_POSTED ]] || fail "someone else's comment counted: $state"
