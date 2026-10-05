@@ -9,6 +9,8 @@
 #   prsmash --include-implicit  # include implicit re-review candidates in manual mode
 #   prsmash --model openai-codex/gpt-5.6-sol --thinking high
 #   prsmash --trusted-authors alice,bob   # configure authors trusted for large PRs
+#   prsmash --all --queue-file q.json     # review a queue prepared by prsmashd
+#   prsmash --approvals-only              # apply Slack approval reactions and exit
 #
 # Large PRs by authors outside the trusted list get their review posted as a
 # comment plus a Slack DM. Reacting to that DM approves (or drops) the PR on the
@@ -18,6 +20,7 @@ set -eo pipefail
 
 QUEUE_SCRIPT="${PRSMASH_QUEUE_SCRIPT:-$HOME/.claude/skills/review-queue/scripts/review-queue.sh}"
 PR_REVIEW_SKILL_DIR="${PR_REVIEW_SKILL_DIR:-$HOME/.claude/skills/pr-review}"
+PRSMASH_SESSION_BIN="${PRSMASH_SESSION_BIN:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/prsmash-session}"
 PRSMASH_SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}")
 PRSMASH_LIB_DIR="${PRSMASH_LIB_DIR:-$(dirname "$PRSMASH_SCRIPT_PATH")/../lib}"
 # shellcheck source=../lib/review-disposition-state.sh
@@ -78,6 +81,8 @@ RESET='\033[0m'
 # --- Args ---
 DRY_RUN=false
 SKIP_SELECT=false
+QUEUE_FILE=""
+APPROVALS_ONLY=false
 INCLUDE_IMPLICIT=false
 # Default model resolution: --model flag > PI_PRSMASH_MODEL env > the model
 # file written by prsmash-model > built-in default. The file lets the default
@@ -95,6 +100,8 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN=true; shift ;;
     --all|--no-select) SKIP_SELECT=true; shift ;;
     --include-implicit) INCLUDE_IMPLICIT=true; shift ;;
+    --queue-file) QUEUE_FILE="${2:-}"; [[ -f "$QUEUE_FILE" ]] || { echo "--queue-file requires an existing file" >&2; exit 1; }; shift 2 ;;
+    --approvals-only) APPROVALS_ONLY=true; shift ;;
     --approval-line-limit) APPROVAL_LINE_LIMIT="${2:-}"; [[ -n "$APPROVAL_LINE_LIMIT" ]] || { echo "--approval-line-limit requires a value" >&2; exit 1; }; shift 2 ;;
     --trusted-authors) TRUSTED_AUTHORS="${2-}"; [[ $# -ge 2 ]] || { echo "--trusted-authors requires a value" >&2; exit 1; }; shift 2 ;;
     --model) MODEL="${2:-}"; [[ -n "$MODEL" ]] || { echo "--model requires a value" >&2; exit 1; }; shift 2 ;;
@@ -147,8 +154,12 @@ fi
 
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
 RUN_DIR="$LOG_ROOT/runs/$RUN_ID"
-mkdir -p "$RUN_DIR"
-ln -sfn "$RUN_DIR" "$LOG_ROOT/latest"
+# prsmashd applies approval reactions every minute; a run directory per poll
+# would bury the review runs.
+if [[ "$APPROVALS_ONLY" != true ]]; then
+  mkdir -p "$RUN_DIR"
+  ln -sfn "$RUN_DIR" "$LOG_ROOT/latest"
+fi
 
 # --- Run-directory retention ---
 # Scheduled every-5-minutes runs accumulate fast (16k+ dirs were once found
@@ -163,7 +174,7 @@ if [[ "$RUN_RETENTION_DAYS" =~ ^[0-9]+$ && "$RUN_RETENTION_DAYS" -gt 0 ]]; then
   disown $! 2>/dev/null || true
 fi
 
-exec > >(tee -a "$RUN_DIR/prsmash.log") 2>&1
+[[ "$APPROVALS_ONLY" == true ]] || exec > >(tee -a "$RUN_DIR/prsmash.log") 2>&1
 
 CHILD_PIDS=()
 CLEANED_RUN_RESOURCES=false
@@ -305,6 +316,7 @@ cleanup_on_signal() {
 trap cleanup_on_signal INT TERM
 trap cleanup_run_resources EXIT
 
+if [[ "$APPROVALS_ONLY" != true ]]; then
 echo -e "${BOLD}prsmash${RESET} — automated PR review queue"
 echo -e "${DIM}Run logs: ${RUN_DIR}${RESET}"
 echo -e "${DIM}Source repo: ${PRSMASH_SOURCE_REPO}${RESET}"
@@ -320,6 +332,7 @@ else
 fi
 echo -e "${DIM}Approval Slack DM target: ${SLACK_APPROVAL_TARGET}${RESET}"
 echo ""
+fi
 
 if ! git -C "$PRSMASH_SOURCE_REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "PRSMASH_SOURCE_REPO is not a git worktree: $PRSMASH_SOURCE_REPO" >&2
@@ -742,14 +755,20 @@ process_pending_approvals() {
 # early — an empty queue is the common case, and a reaction left since the last
 # run still has to be applied.
 process_pending_approvals
+[[ "$APPROVALS_ONLY" == true ]] && exit 0
 
 # --- Fetch queue ---
-echo -e "${DIM}Fetching review queue...${RESET}"
-queue_args=()
-if [[ "$INCLUDE_IMPLICIT" == true ]] && [[ "$SKIP_SELECT" == false ]]; then
-  queue_args+=(--include-implicit)
+if [[ -n "$QUEUE_FILE" ]]; then
+  # prsmashd has already worked out eligibility for this PR.
+  queue_json=$(cat "$QUEUE_FILE")
+else
+  echo -e "${DIM}Fetching review queue...${RESET}"
+  queue_args=()
+  if [[ "$INCLUDE_IMPLICIT" == true ]] && [[ "$SKIP_SELECT" == false ]]; then
+    queue_args+=(--include-implicit)
+  fi
+  queue_json=$($QUEUE_SCRIPT "${queue_args[@]}")
 fi
-queue_json=$($QUEUE_SCRIPT "${queue_args[@]}")
 printf '%s\n' "$queue_json" > "$RUN_DIR/queue.json"
 
 # Some queue-script versions return a human-readable message before the current
@@ -887,6 +906,9 @@ errored=0
 # that scheduled runs overlap, not a failure. Counting it separately keeps
 # errored meaning "something actually went wrong".
 skipped=0
+# Head moved in a way a steer could not cover (force-push, oversized delta);
+# the review was abandoned unrecorded so prsmashd reviews the new head.
+superseded=0
 
 is_retryable() {
   local log_file=$1
@@ -985,45 +1007,66 @@ run_pr_review() {
   local worktree_dir="$RUN_DIR/worktrees/pr-${pr_number}"
   local tmp_dir="$RUN_DIR/tmp/pr-${pr_number}"
   local result_file="$tmp_dir/review-result.json"
+  local expected_head_file="$tmp_dir/expected-head"
   mkdir -p "$session_dir" "$tmp_dir"
   rm -f "$result_file"
 
   prepare_pr_context "$pr_number" "$pr_repo" "$worktree_dir" "$tmp_dir"
   local analyzed_head
   analyzed_head=$(git -C "$worktree_dir" rev-parse HEAD)
+  # The head the posting helper will accept. A steered review moves it forward
+  # (prsmash-session), so it is a file rather than only an environment value.
+  printf '%s\n' "$analyzed_head" > "$expected_head_file"
 
   # Incremental re-review: when we know the commit our last review looked at,
   # narrow the review to what changed since. Only valid if that commit is an
   # ancestor of the current head (a rebase/force-push invalidates it).
-  local skill_cmd="/skill:pr-review --headless --post --independent-checks --pr ${pr_number}"
+  # --head pins the review to the commit this worktree holds. Without it the
+  # skill re-read headRefOid itself, and a push in between made it review a
+  # different commit from the one the posting guard expected (lleverage#7738).
+  local skill_cmd="/skill:pr-review --headless --post --independent-checks --pr ${pr_number} --head ${analyzed_head}"
   if [[ -n "$since_commit" && "$since_commit" != "null" ]]; then
     if git -C "$worktree_dir" cat-file -e "$since_commit" 2>/dev/null \
        && git -C "$worktree_dir" merge-base --is-ancestor "$since_commit" HEAD 2>/dev/null \
        && [[ "$since_commit" != "$(git -C "$worktree_dir" rev-parse HEAD)" ]]; then
-      skill_cmd="/skill:pr-review --headless --post --independent-checks --pr ${pr_number} --since ${since_commit}"
+      skill_cmd+=" --since ${since_commit}"
       echo "incrementalReviewSince=${since_commit}"
     else
       echo "incrementalReviewSince=invalid (${since_commit} not an ancestor of head; running full review)"
     fi
   fi
 
-  local args=(--session-dir "$session_dir" --skill "$PR_REVIEW_SKILL_DIR" -p "$skill_cmd")
-  if [[ -n "$THINKING_LEVEL" ]]; then
-    args=(--thinking "$THINKING_LEVEL" "${args[@]}")
-  fi
-  if [[ -n "$MODEL" ]]; then
-    args=(--model "$MODEL" "${args[@]}")
+  echo "reviewTimeoutSeconds=${review_timeout}"
+  local runner
+  if [[ -n "${PRSMASH_CONTROL_DIR:-}" ]]; then
+    # Started by prsmashd: run pi over RPC so new commits can be steered in.
+    # prsmash-session owns the deadline (extended per steer, capped); the
+    # outer timeout is only a backstop.
+    local max_timeout=$(( review_timeout * 2 > MAX_REVIEW_TIMEOUT ? review_timeout * 2 : MAX_REVIEW_TIMEOUT ))
+    echo "reviewRunner=rpc controlDir=${PRSMASH_CONTROL_DIR}"
+    local session_args=(--session-dir "$session_dir" --skill "$PR_REVIEW_SKILL_DIR" --pr "$pr_number"
+      --timeout "$review_timeout" --max-timeout "$max_timeout" --prompt "$skill_cmd")
+    [[ -n "$THINKING_LEVEL" ]] && session_args+=(--thinking "$THINKING_LEVEL")
+    [[ -n "$MODEL" ]] && session_args+=(--model "$MODEL")
+    runner=(timeout --kill-after=60 "$((max_timeout + 300))" "$PRSMASH_SESSION_BIN" "${session_args[@]}")
+  else
+    local args=(--session-dir "$session_dir" --skill "$PR_REVIEW_SKILL_DIR" -p "$skill_cmd")
+    if [[ -n "$THINKING_LEVEL" ]]; then
+      args=(--thinking "$THINKING_LEVEL" "${args[@]}")
+    fi
+    if [[ -n "$MODEL" ]]; then
+      args=(--model "$MODEL" "${args[@]}")
+    fi
+    runner=(timeout --kill-after=60 "$review_timeout" pi "${args[@]}")
   fi
   # Keep the timeout inside setsid: `setsid pi` may fork rather than exec, which
   # would let an outer timeout return before pi has finished.
-  echo "reviewTimeoutSeconds=${review_timeout}"
-  local runner=(timeout --kill-after=60 "$review_timeout" pi "${args[@]}")
   if command -v setsid >/dev/null 2>&1; then
     runner=(setsid "${runner[@]}")
   fi
 
   local rc=0
-  (cd "$worktree_dir" && TMPDIR="$tmp_dir" PR_REVIEW_TMPDIR="$tmp_dir" PRSMASH_REVIEW_RESULT_FILE="$result_file" PRSMASH_REVIEW_EXPECTED_HEAD="$analyzed_head" PRSMASH_APPROVAL_LINE_LIMIT="$APPROVAL_LINE_LIMIT" PRSMASH_TRUSTED_AUTHORS="$TRUSTED_AUTHORS" PRSMASH_AUTO_APPROVE_ALL="$AUTO_APPROVE_ALL" "${runner[@]}") || rc=$?
+  (cd "$worktree_dir" && TMPDIR="$tmp_dir" PR_REVIEW_TMPDIR="$tmp_dir" PRSMASH_REVIEW_RESULT_FILE="$result_file" PRSMASH_REVIEW_EXPECTED_HEAD="$analyzed_head" PRSMASH_REVIEW_EXPECTED_HEAD_FILE="$expected_head_file" PRSMASH_APPROVAL_LINE_LIMIT="$APPROVAL_LINE_LIMIT" PRSMASH_TRUSTED_AUTHORS="$TRUSTED_AUTHORS" PRSMASH_AUTO_APPROVE_ALL="$AUTO_APPROVE_ALL" "${runner[@]}") || rc=$?
   if [[ $rc -eq 124 || $rc -eq 137 ]]; then
     echo "PRSMASH_REVIEW_TIMEOUT: killed after ${review_timeout}s"
   fi
@@ -1123,7 +1166,7 @@ review_pr_bg() {
   local last_activity_at=${8:-}
   local pr_author=${9:-}
   local start end duration attempt=1 latest_state lock_name disposition_source
-  local result_file analyzed_head reviews_json started_at outcome
+  local result_file analyzed_head reviews_json issue_comments_json started_at outcome
   local pr_meta changed_lines timeout_file timeout_count review_timeout review_rc
   local decision activity_count=0 merge_state preamble=""
 
@@ -1201,6 +1244,13 @@ review_pr_bg() {
   while [[ $attempt -le $MAX_RETRIES ]]; do
     review_rc=0
     { printf '%s' "$preamble"; run_pr_review "$pr_number" "$pr_repo" "$since_commit" "$review_timeout"; } > "$log_file" 2>&1 || review_rc=$?
+    if [[ "$review_rc" -eq 75 ]]; then
+      # prsmash-session gave up on a head it could not steer onto. Record
+      # nothing, so the new head is reviewed from scratch.
+      end=$(date +%s)
+      printf 'OK|SUPERSEDED|%d\n' "$((end - start))" > "$status_file"
+      return 0
+    fi
     if [[ "$review_rc" -eq 0 ]]; then
       rm -f "$timeout_file"
       end=$(date +%s)
@@ -1212,12 +1262,17 @@ review_pr_bg() {
       # to a review GitHub holds for this exact head from during this run.
       # Paginate: a single page (30) can miss recent reviews on busy PRs.
       reviews_json=$(gh api --paginate --slurp "repos/${pr_repo}/pulls/${pr_number}/reviews" 2>/dev/null || echo '[]')
+      issue_comments_json=$(gh api --paginate --slurp "repos/${pr_repo}/issues/${pr_number}/comments?since=${started_at}" 2>/dev/null || echo '[]')
       append_latest_review_body "$pr_number" "$pr_repo" "$log_file"
       result_file="$RUN_DIR/tmp/pr-${pr_number}/review-result.json"
-      analyzed_head=$(git -C "$RUN_DIR/worktrees/pr-${pr_number}" rev-parse HEAD 2>/dev/null || true)
+      # A steered review ends on a later head than it started on; the
+      # expected-head file holds the one it was told to publish against.
+      analyzed_head=$(head -n1 "$RUN_DIR/tmp/pr-${pr_number}/expected-head" 2>/dev/null | tr -d '[:space:]' || true)
+      [[ "$analyzed_head" =~ ^[0-9a-f]{40}$ ]] \
+        || analyzed_head=$(git -C "$RUN_DIR/worktrees/pr-${pr_number}" rev-parse HEAD 2>/dev/null || true)
       [[ -n "$analyzed_head" ]] || analyzed_head="$head_oid"
       outcome=$(review_run_outcome "$result_file" "$pr_repo" "$pr_number" "$analyzed_head" \
-        "$reviews_json" "$user" "$started_at")
+        "$reviews_json" "$user" "$started_at" "$issue_comments_json")
       IFS=$'\t' read -r latest_state disposition_source <<<"$outcome"
       echo "prsmashOutcome=${latest_state} head=${analyzed_head} disposition=${disposition_source:-none}" >> "$log_file"
       # Record every outcome against this head, including approvals and
@@ -1356,6 +1411,9 @@ while [[ $completed -lt $total ]]; do
       notify_pr_ntfy "$(ntfy_kind_for_state "$latest_state")" "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$time_str" || true
       not_posted=$((not_posted + 1))
       reviewed=$((reviewed + 1)) ;;
+    OK:SUPERSEDED)
+      echo -e "${prefix} ${YELLOW}Superseded${RESET} ${suffix} ${DIM}— the head moved in a way the review could not follow; the new head gets a fresh review${RESET}"
+      superseded=$((superseded + 1)) ;;
     OK:*)
       echo -e "${prefix} ${BLUE}Commented${RESET} ${suffix}"
       notify_pr_ntfy "$(ntfy_kind_for_state "$latest_state")" "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$time_str" || true
@@ -1384,6 +1442,7 @@ changes_requested=$changes_requested
 incomplete=$incomplete
 not_posted=$not_posted
 conflicting=$conflicting
+superseded=$superseded
 EOF
 
 cleanup_run_resources
@@ -1402,6 +1461,9 @@ if [[ "$incomplete" -gt 0 ]]; then
 fi
 if [[ "$conflicting" -gt 0 ]]; then
   echo -e "  ${YELLOW}${conflicting} conflicting${RESET} ${DIM}— not reviewed; conflict notice posted, re-review once resolved${RESET}"
+fi
+if [[ "$superseded" -gt 0 ]]; then
+  echo -e "  ${YELLOW}${superseded} superseded${RESET} ${DIM}— head moved beyond what a steer could cover; the new head is reviewed afresh${RESET}"
 fi
 if [[ "$not_posted" -gt 0 ]]; then
   echo -e "  ${YELLOW}${not_posted} not posted${RESET} ${DIM}— reviewer published nothing; check the logs${RESET}"

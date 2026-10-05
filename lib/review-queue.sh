@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -eo pipefail
 
-# Usage: review-queue.sh [--user USERNAME] [--include-implicit]
+# Usage: review-queue.sh [--user USERNAME] [--include-implicit] [--only N[,N...]]
+#
+# --only limits the per-PR GraphQL enrichment to the listed PR numbers. prsmashd
+# uses it to re-check just the PRs that changed since its last poll.
 #
 # Queue sources:
 #   review-request      — PRs where our review is explicitly requested
@@ -20,10 +23,12 @@ set -eo pipefail
 #                         included with --include-implicit, for manual selection.
 TARGET_USER=""
 INCLUDE_IMPLICIT=false
+ONLY_PRS=
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --user) TARGET_USER="$2"; shift 2 ;;
     --include-implicit) INCLUDE_IMPLICIT=true; shift ;;
+    --only) ONLY_PRS="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
@@ -78,6 +83,12 @@ prs=$(echo "$prs" | jq --arg me "$REVIEW_USER" '[.[] | select(
   (.author.login | test("dependabot|snyk"; "i") | not) and
   (.title | startswith("[Snyk]") | not)
 )]')
+
+if [ -n "$ONLY_PRS" ]; then
+  prs=$(echo "$prs" | jq --arg only "$ONLY_PRS" '
+    ($only | split(",") | map(select(length > 0) | tonumber)) as $keep
+    | [.[] | select(.number as $n | $keep | index($n) != null)]')
+fi
 
 if [ -z "$prs" ] || [ "$prs" = "[]" ]; then
   if [ -n "$TARGET_USER" ]; then

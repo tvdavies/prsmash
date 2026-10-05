@@ -317,10 +317,52 @@ model file > built-in default (`anthropic-claude-code/claude-opus-4-8`).
   surfaced as `[implicit re-review]`. These are never included in
   `--all` runs — you must select them by hand in `fzf`.
 
-## Run on a schedule (systemd)
+## Run continuously (prsmashd)
 
-`systemd/` contains user units that run `prsmash --all` every 30
-minutes:
+`prsmashd` starts a review as soon as a PR becomes eligible, rather than on the
+next timer tick, and keeps a running review in step with the PR:
+
+- **Events.** It polls the open-PR list every `PRSMASH_POLL_SECONDS` (20) with
+  `If-None-Match`, so an unchanged list is a free 304. PRs whose head, update
+  time or review requests changed are re-checked with
+  `lib/review-queue.sh --only N,...`; a full sweep every `PRSMASH_SWEEP_SECONDS`
+  (600) catches what the list does not show, such as resolved threads. The
+  source sits behind a small interface so a webhook relay can feed it later.
+- **Concurrency.** At most `PRSMASH_MAX_CONCURRENT_REVIEWS` (4) reviews run at
+  once, oldest event first. A PR is "in review" while its per-PR lock is held,
+  so reviews left running across a daemon restart still count and are never
+  duplicated.
+- **Steering.** Reviews run `pi` in RPC mode through `prsmash-session`. When a
+  PR's head moves mid-review, the daemon drops a control message; the session
+  fetches the new commits, moves the expected head the posting helper accepts
+  (`PRSMASH_REVIEW_EXPECTED_HEAD_FILE`), and steers the reviewer onto the delta,
+  keeping the context it has built. A push that lands just after the reviewer
+  finishes is followed up in the same session (`PRSMASH_SESSION_GRACE_SECONDS`,
+  40). A force-push, a delta over `PRSMASH_STEER_MAX_LINES` (600) or more than
+  `PRSMASH_MAX_STEERS` (3) moves ends the review as `SUPERSEDED`: nothing is
+  recorded or notified, and the new head gets a fresh review.
+- **Approvals.** Slack approval reactions are applied every
+  `PRSMASH_APPROVALS_SECONDS` (60) via `prsmash --approvals-only`.
+
+Each review is a transient `prsmash-run-pr<N>-*` user unit
+(`PRSMASH_REVIEW_LAUNCHER=systemd-run`), so `prsmash-run-.service.d` limits and
+`prsmash.slice` apply. `prsmashd --dry-run` logs what it would start and steer
+without doing either.
+
+```bash
+ln -s "$PWD/bin/prsmashd" ~/.local/bin/prsmashd
+ln -s "$PWD/systemd/prsmashd.service" ~/.config/systemd/user/
+# machine-specific overrides go in ~/.config/systemd/user/prsmashd.service.d/
+systemctl --user daemon-reload
+systemctl --user disable --now prsmash-hourly.timer
+systemctl --user enable --now prsmashd.service
+journalctl --user -fu prsmashd
+```
+
+## Run on a schedule (systemd timer)
+
+The older timer units run `prsmash --all` every five minutes. Use them instead
+of `prsmashd`, not alongside it:
 
 ```bash
 cp systemd/prsmash-hourly.* ~/.config/systemd/user/
@@ -338,9 +380,13 @@ lib/review-outcome.sh          maps a finished review to its status and ntfy mes
 lib/review-disposition-state.sh  exact heads already handled, and when they earn another look
 lib/merge-conflicts.sh         mergeability check, trial merge and the conflict notice
 bin/prsmash-merge-check        print the conflict notice for a PR without posting it
+bin/prsmashd                   event-driven daemon (daemon/prsmashd.ts)
+bin/prsmash-session            one review over pi RPC, steerable (daemon/session.ts)
+daemon/test/*.test.ts          node --test suites for the daemon and session
 lib/review-timeout.sh          adaptive review timeouts
 tests/*.test.sh                bash tests with stubbed gh, pi and curl
-systemd/prsmash-hourly.*       half-hourly timer for prsmash --all
+systemd/prsmashd.service       the daemon
+systemd/prsmash-hourly.*       five-minute timer for prsmash --all (legacy)
 ```
 
 Each run writes to `$PRSMASH_LOG_DIR/runs/<run-id>/` (symlinked from
@@ -352,7 +398,7 @@ pr-<N>-<repo>.log        full review log + our latest GitHub review body
 pr-<N>.status            machine-readable outcome: OK|<STATE>|<secs>, LOCKED, HANDLED or ERR
                          (STATE: APPROVED, CHANGES_REQUESTED, COMMENTED,
                          MANUAL_APPROVAL_REQUIRED, INCOMPLETE, NOT_POSTED,
-                         CONFLICTING)
+                         CONFLICTING, SUPERSEDED)
 sessions/pr-<N>/         pi session for the review
 summary.txt              reviewed/approved/errored counts
 ```

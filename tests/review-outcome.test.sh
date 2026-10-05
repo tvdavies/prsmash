@@ -124,4 +124,18 @@ IFS=$'\t' read -r title priority tags <<<"$(ntfy_message_spec conflicting 7250)"
 ntfy_message_body conflicting "Title" alice 0m0s | grep -q 're-review once resolved' \
   || fail "conflicting body does not promise the re-review"
 
+# A non-blocking verdict posted as an issue comment, with the result file
+# missing (lleverage#7734: the reviewer pointed the helper elsewhere). Our
+# comment from during the run is the review; an older one is not.
+rm -f "$result"
+comments=$(jq -nc --arg at "2026-10-02T07:15:00Z" '[[{user:{login:"tvdavies"},created_at:$at,body:"review"}]]')
+IFS=$'\t' read -r state source <<<"$(review_run_outcome "$result" "$repo" "$pr" "$head" '[]' tvdavies "$started" "$comments")"
+[[ "$state|$source" == "COMMENTED|issue-comment-review" ]] || fail "issue comment during the run: $state|$source"
+old_comment=$(jq -nc '[[{user:{login:"tvdavies"},created_at:"2026-10-01T07:15:00Z"}]]')
+IFS=$'\t' read -r state source <<<"$(review_run_outcome "$result" "$repo" "$pr" "$head" '[]' tvdavies "$started" "$old_comment")"
+[[ "$state" == NOT_POSTED ]] || fail "an issue comment from before the run counted: $state"
+someone_else=$(jq -nc '[[{user:{login:"bob"},created_at:"2026-10-02T07:15:00Z"}]]')
+IFS=$'\t' read -r state source <<<"$(review_run_outcome "$result" "$repo" "$pr" "$head" '[]' tvdavies "$started" "$someone_else")"
+[[ "$state" == NOT_POSTED ]] || fail "someone else's comment counted: $state"
+
 echo "review-outcome tests passed"

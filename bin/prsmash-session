@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Run one pr-review in pi's RPC mode so prsmashd can steer it. See daemon/session.ts.
+exec node --disable-warning=ExperimentalWarning "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../daemon/session.ts" "$@"
