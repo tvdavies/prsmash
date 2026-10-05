@@ -8,6 +8,9 @@
 //   followup  settle at once; answer a later prompt and settle again
 //   late-steer settle just as a steer arrives, leaving it queued (as real pi
 //             does for an idle session); answer the reclaiming prompt
+//   steer-rejected  keep running; refuse steers
+//   clear-fails     like late-steer, but clear_queue fails
+//   slow-abort      keep running; on abort settle at once but answer 2s later
 import { appendFileSync } from "node:fs";
 
 const mode = process.env.FAKE_PI_MODE || "quick";
@@ -60,7 +63,11 @@ function handle(command) {
       break;
     }
     case "steer":
-      if (mode === "late-steer") {
+      if (mode === "steer-rejected") {
+        emit({ type: "response", id: command.id, command: "steer", success: false, error: "refused" });
+        break;
+      }
+      if (mode === "late-steer" || mode === "clear-fails") {
         say("finished on the old head");
         settle();
         queuedSteering.push(command.message);
@@ -76,9 +83,17 @@ function handle(command) {
     case "abort":
       say("", { stopReason: "aborted" });
       settle();
-      emit({ type: "response", id: command.id, command: "abort", success: true });
+      if (mode === "slow-abort") {
+        setTimeout(() => emit({ type: "response", id: command.id, command: "abort", success: true }), 2000);
+      } else {
+        emit({ type: "response", id: command.id, command: "abort", success: true });
+      }
       break;
     case "clear_queue":
+      if (mode === "clear-fails") {
+        emit({ type: "response", id: command.id, command: "clear_queue", success: false, error: "boom" });
+        break;
+      }
       emit({ type: "response", id: command.id, command: "clear_queue", success: true, data: { steering: queuedSteering, followUp: [] } });
       queuedSteering = [];
       break;

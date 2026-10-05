@@ -217,3 +217,40 @@ test("a delta whose patch is bigger than an in-memory buffer is streamed to disk
   assert.ok(session.commands().some((c) => c.type === "steer"));
   assert.ok(existsSync(join(fx.tmp, `delta-${fx.head.slice(0, 12)}-${next.slice(0, 12)}.diff`)));
 });
+
+for (const mode of ["steer-rejected", "clear-fails"]) {
+  test(`a move that cannot be delivered (${mode}) supersedes the review instead of finishing normally`, async () => {
+    const fx = fixture();
+    const session = run(fx, mode);
+    await sleep(300);
+    const next = commit(fx.author, "b.txt", "x\n", "undeliverable");
+    git(fx.author, "push", "-q", fx.origin, "HEAD:refs/pull/1/head");
+    control(fx, next);
+    assert.equal(await session.done, 75, session.err());
+    assert.match(session.out(), /PRSMASH_SUPERSEDED: could not/);
+  });
+}
+
+test("a timeout wins even if the reviewer settles while the abort is pending", async () => {
+  const fx = fixture();
+  const piLog = join(fx.root, "pi.jsonl");
+  const child = spawn(sessionBin, ["--pr", "1", "--prompt", "review", "--timeout", "1"], {
+    cwd: fx.worktree,
+    env: {
+      ...process.env,
+      PRSMASH_PI_BIN: fakePi,
+      FAKE_PI_MODE: "slow-abort",
+      FAKE_PI_LOG: piLog,
+      PRSMASH_CONTROL_DIR: fx.control,
+      PRSMASH_REVIEW_EXPECTED_HEAD_FILE: join(fx.tmp, "expected-head"),
+      PR_REVIEW_TMPDIR: fx.tmp,
+      PRSMASH_SESSION_POLL_SECONDS: "0.1",
+      PRSMASH_SESSION_GRACE_SECONDS: "0",
+    },
+  });
+  let out = "";
+  child.stdout.on("data", (c) => (out += c));
+  const code = await new Promise<number>((r) => child.on("exit", (c) => r(c ?? -1)));
+  assert.equal(code, 124);
+  assert.match(out, /PRSMASH_REVIEW_TIMEOUT/);
+});

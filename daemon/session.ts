@@ -354,8 +354,11 @@ async function handleControl(): Promise<void> {
     else steerUnconfirmed = true;
     const response = await send(command);
     if (response.success !== true) {
-      note(`${command.type} rejected: ${String(response.error)}`);
+      // The expected head has moved but the reviewer may never hear about it.
+      // Finishing normally would record a head nobody reviewed, so give the
+      // review up and let the new head be reviewed from scratch.
       if (followUp) running = false;
+      return supersede(`could not deliver the move to ${delta.to}: ${String(response.error)}`);
     }
   }
 }
@@ -366,14 +369,17 @@ async function reclaimQueuedSteers(): Promise<void> {
   if (!steerUnconfirmed) return;
   steerUnconfirmed = false;
   const cleared = await send({ type: "clear_queue" });
+  if (cleared.success !== true) {
+    return supersede(`could not confirm the steer was delivered: ${String(cleared.error)}`);
+  }
   const queued = ((cleared.data as { steering?: string[] } | undefined)?.steering ?? []).filter(Boolean);
-  if (cleared.success !== true || queued.length === 0) return;
+  if (queued.length === 0) return;
   note(`a steer reached pi as it settled; sending it as a follow-up`);
   running = true;
   const response = await send({ type: "prompt", message: queued.join("\n\n") });
   if (response.success !== true) {
-    note(`follow-up rejected: ${String(response.error)}`);
     running = false;
+    return supersede(`could not resend the steer: ${String(response.error)}`);
   }
 }
 
@@ -391,22 +397,35 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function shutdown(code: number): Promise<never> {
+// The one way out. The first caller fixes the exit code synchronously, so a
+// timeout that fires while the main loop is awaiting cannot be overtaken by a
+// later "settled normally" exit; later callers wait on the same ending.
+let terminal: Promise<never> | undefined;
+function shutdown(code: number, options: { abortFirst?: boolean } = {}): Promise<never> {
+  if (terminal) return terminal;
   finishing = true;
-  pi.stdin!.end();
-  const exited = await Promise.race([piExited, sleep(30_000).then(() => undefined)]);
-  if (exited === undefined) {
-    killPi("SIGTERM");
-    await Promise.race([piExited, sleep(10_000)]);
-    killPi("SIGKILL");
-  }
-  process.exit(code);
+  terminal = (async (): Promise<never> => {
+    if (options.abortFirst) {
+      await send({ type: "abort" }, 30_000);
+      killPi("SIGTERM");
+    }
+    pi.stdin!.end();
+    const exited = await Promise.race([piExited, sleep(30_000).then(() => undefined)]);
+    if (exited === undefined) {
+      killPi("SIGTERM");
+      await Promise.race([piExited, sleep(10_000)]);
+      killPi("SIGKILL");
+    }
+    process.exit(code);
+  })();
+  return terminal;
 }
 
 for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
   process.on(signal, () => {
     if (finishing) return;
     finishing = true;
+    terminal = new Promise<never>(() => {});
     killPi("SIGTERM");
     setTimeout(() => {
       killPi("SIGKILL");
@@ -423,10 +442,7 @@ const watchdog = setInterval(() => {
   if (timingOut || finishing || Date.now() <= Math.min(deadline, hardDeadline)) return;
   timingOut = true;
   process.stdout.write(`PRSMASH_REVIEW_TIMEOUT: no result after ${Math.round((Date.now() - startedAt) / 1000)}s\n`);
-  void send({ type: "abort" }, 30_000).then(() => {
-    killPi("SIGTERM");
-    return shutdown(EXIT_TIMEOUT);
-  });
+  void shutdown(EXIT_TIMEOUT, { abortFirst: true });
 }, 1_000);
 watchdog.unref();
 
@@ -444,12 +460,15 @@ async function main(): Promise<void> {
 
   while (true) {
     await sleep(pollMs);
-    if (timingOut) return;
+    if (finishing) return;
     if (piGone) break;
     if (!superseded) await handleControl();
+    if (finishing) return;
     if (superseded && !running) break;
     if (running || superseded) continue;
     await reclaimQueuedSteers();
+    if (finishing) return;
+    if (superseded) break;
     if (running) continue;
     // Settled. Unless the review is already published for the current head,
     // linger briefly: a push that lands as the reviewer finishes (often the
@@ -463,7 +482,7 @@ async function main(): Promise<void> {
 
   if (piGone && running) {
     note("pi exited before the review settled");
-    process.exit(1);
+    await shutdown(1);
   }
 
   const text = (lastAssistant?.content ?? [])
