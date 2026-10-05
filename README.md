@@ -254,6 +254,8 @@ Then point it at your setup (env vars, with these defaults):
 | `PRSMASH_MAX_REVIEW_TIMEOUT` | `7200` | Maximum timeout in seconds; used immediately for large PRs and after repeated timeouts |
 | `PRSMASH_LARGE_PR_LINES` | `1001` | Additions + deletions at which a PR gets the maximum timeout immediately |
 | `PRSMASH_LOG_DIR` | `~/.prsmash` | Locks, run logs, notification markers |
+| `PRSMASH_RUN_RETENTION_DAYS` | `7` | Run directories older than this are deleted at the start of each run (`0` disables) |
+| `PRSMASH_CLEANUP_IMAGE` | `busybox:stable` | Image used to delete run files a review container created as another user |
 | `PRSMASH_SLACK_SCRIPT` | `~/.claude/skills/slack/scripts/slack.sh` | Slack send helper |
 | `PRSMASH_SLACK_APPROVAL_NOTIFY` | `true` | Toggle Slack notifications |
 | `PRSMASH_SLACK_APPROVAL_TARGET` | `@tom` | DM target (resolved via the helper) |
@@ -339,6 +341,7 @@ lib/review-disposition-state.sh  exact heads already handled, and when they earn
 lib/merge-conflicts.sh         mergeability check, trial merge and the conflict notice
 bin/prsmash-merge-check        print the conflict notice for a PR without posting it
 lib/review-timeout.sh          adaptive review timeouts
+lib/run-retention.sh           deletes expired run directories, including container-owned files
 tests/*.test.sh                bash tests with stubbed gh, pi and curl
 systemd/prsmash-hourly.*       half-hourly timer for prsmash --all
 ```
@@ -356,6 +359,12 @@ pr-<N>.status            machine-readable outcome: OK|<STATE>|<secs>, LOCKED, HA
 sessions/pr-<N>/         pi session for the review
 summary.txt              reviewed/approved/errored counts
 ```
+
+Run directories older than `PRSMASH_RUN_RETENTION_DAYS` are deleted in the
+background at the start of each run. A review that bind-mounts part of its
+`tmp/` into a container (ClickHouse data, for example) can leave files owned by
+the container's user, which a plain `rm -rf` cannot delete; those directories
+are emptied from a short-lived root container (`PRSMASH_CLEANUP_IMAGE`) instead.
 
 ## Notes
 
