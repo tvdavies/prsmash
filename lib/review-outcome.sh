@@ -13,20 +13,25 @@
 #   MANUAL_APPROVAL_REQUIRED  approval held back for a human (comment posted)
 #   INCOMPLETE                a COMMENTED "review incomplete" review was posted
 #   NOT_POSTED                the reviewer finished but published nothing
+#   SUPERSEDED                abandoned because the head moved in a way the
+#                             review could not follow; nothing recorded
+#                             (written by prsmash itself, not by this function)
 #   CONFLICTING               not reviewed: the branch conflicts with its base
 #                             and a conflict notice was posted instead
 #                             (written by prsmash itself, not by this function)
 
-# review_run_outcome RESULT_FILE REPO PR HEAD REVIEWS_JSON LOGIN STARTED_AT
+# review_run_outcome RESULT_FILE REPO PR HEAD REVIEWS_JSON LOGIN STARTED_AT [ISSUE_COMMENTS_JSON]
 #
 # Prints "STATE<TAB>DISPOSITION_SOURCE". A non-empty disposition source means
 # the head must be recorded as handled, so later runs skip it until a new
 # commit arrives. REVIEWS_JSON is the reviews listing (flat, or the page array
 # from `gh api --paginate --slurp`); STARTED_AT is an ISO-8601 UTC timestamp
-# (YYYY-MM-DDTHH:MM:SSZ) from before the review began.
+# (YYYY-MM-DDTHH:MM:SSZ) from before the review began. ISSUE_COMMENTS_JSON, when
+# given, is the PR's issue-comment listing in the same shapes.
 review_run_outcome() {
   local result_file=$1 repo=$2 pr_number=$3 head_oid=$4 reviews_json=$5 login=$6 started_at=$7
-  local posting event verdict manual github_state
+  local issue_comments_json=${8:-[]}
+  local posting event verdict manual github_state commented
 
   if [[ -n "$result_file" && -f "$result_file" ]] \
       && [[ "$pr_number" =~ ^[0-9]+$ ]] \
@@ -69,6 +74,20 @@ review_run_outcome() {
     CHANGES_REQUESTED) printf 'CHANGES_REQUESTED\t\n' ;;
     COMMENTED) printf 'COMMENTED\tcommented-review\n' ;;
     *)
+      # Non-blocking verdicts are posted as an issue comment, which has no
+      # review state (lleverage#7734 was reported unposted after posting one).
+      # Only a comment of ours from this run carrying the posting helper's
+      # marker for this exact head counts; any other comment proves nothing.
+      commented=$(jq -r --arg me "$login" --arg since "$started_at" \
+          --arg marker "<!-- pr-review reviewed-head=${head_oid} -->" '
+          (if length > 0 and (.[0] | type) == "array" then add else . end)
+          | [.[] | select(.user.login == $me and (.created_at // "") >= $since
+                          and ((.body // "") | contains($marker)))]
+          | length' <<<"${issue_comments_json:-[]}" 2>/dev/null || echo 0)
+      if [[ "$commented" =~ ^[0-9]+$ && "$commented" -gt 0 ]]; then
+        printf 'COMMENTED\tissue-comment-review\n'
+        return 0
+      fi
       # Nothing was published for this head. Re-running the same review on the
       # same commit would only repeat that outcome every few minutes, so the
       # head is recorded as handled and the notification says what happened.

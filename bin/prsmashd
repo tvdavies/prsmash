@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Event-driven prsmash. See daemon/prsmashd.ts.
+exec node --disable-warning=ExperimentalWarning "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../daemon/prsmashd.ts" "$@"

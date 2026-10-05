@@ -125,4 +125,20 @@ result=$(run_case 1 '[]' "[$pr]" "$suggested_pushed")
 jq -e '.prs[0].queueSource == "suggestions-answered"' <<<"$result" >/dev/null \
   || { echo "pushed COMMENTED round with open suggestion threads did not re-enter: $result" >&2; exit 1; }
 
+# --only: prsmashd re-checks just the PRs that changed. Others found by the
+# searches are left alone (and not enriched).
+other=$(jq -c '.number = 456' <<<"$pr")
+result=$(env PATH="$TMP/bin:$PATH" REQUESTED_PRS="[$pr,$other]" REVIEWED_PRS='[]' GRAPHQL_PR="$base" \
+  bash "$SCRIPT" --user alice --only 456)
+jq -e '[.prs[].number] == [456]' <<<"$result" >/dev/null \
+  || { echo "--only 456 returned: $result" >&2; exit 1; }
+result=$(env PATH="$TMP/bin:$PATH" REQUESTED_PRS="[$pr,$other]" REVIEWED_PRS='[]' GRAPHQL_PR="$base" \
+  bash "$SCRIPT" --user alice --only 123,456)
+jq -e '[.prs[].number] | sort == [123,456]' <<<"$result" >/dev/null \
+  || { echo "--only 123,456 returned: $result" >&2; exit 1; }
+if env PATH="$TMP/bin:$PATH" REQUESTED_PRS="[$pr]" REVIEWED_PRS='[]' GRAPHQL_PR="$base" \
+    bash "$SCRIPT" --user alice --only 999 | jq -e . >/dev/null 2>&1; then
+  echo "--only with no match should give the plain empty-queue message" >&2; exit 1
+fi
+
 echo "review queue tests passed"

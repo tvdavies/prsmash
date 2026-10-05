@@ -1,0 +1,33 @@
+[Unit]
+Description=prsmash daemon: start PR reviews as they become eligible
+Documentation=file:///home/tvd/dev/tvdavies/prsmash/README.md
+After=network-online.target
+
+[Service]
+# Replaces prsmash-hourly.timer. Polls the open-PR list every 20s with ETags
+# (unchanged polls cost nothing against the REST quota), re-checks only the PRs
+# that changed, and steers a running review onto commits pushed mid-review.
+# Each review runs as its own transient prsmash-run-* unit, so the
+# prsmash-run-.service.d limits and prsmash.slice budget still apply, and
+# restarting this service (deploys, crashes) leaves reviews in flight running.
+Type=simple
+ExecStart=/home/tvd/.local/bin/prsmashd
+Restart=always
+RestartSec=10
+WorkingDirectory=/home/tvd/dev/lleverage-ai/lleverage
+
+Environment=PRSMASH_LOG_DIR=/home/tvd/.prsmash
+Environment=PRSMASH_REVIEW_LAUNCHER=systemd-run
+Environment=PRSMASH_MAX_CONCURRENT_REVIEWS=4
+Environment=PATH=/home/tvd/.pi/agent/bin:/home/tvd/.local/bin:/home/tvd/.local/share/nvm/v24.15.0/bin:/usr/bin:/bin:/opt/google-cloud-cli/bin
+Environment=PR_REVIEW_SKILL_DIR=/home/tvd/.claude/skills/pr-review
+
+# See prsmash-hourly.service: these live in fish's config, which the systemd
+# user manager never reads. Every PRSMASH_*, PI_*, PR_REVIEW_* and SLACK_MCP_*
+# variable here is forwarded to the review units.
+Environment=PI_CLAUDE_CODE_API_KEY_FILE=/home/tvd/.cli-proxy-api/proxy.key
+Environment=PI_CLAUDE_CODE_BASE_URL=http://127.0.0.1:8317
+EnvironmentFile=-/home/tvd/.prsmash/slack.env
+
+[Install]
+WantedBy=default.target
