@@ -55,7 +55,9 @@ case "$1 $2" in
   'api --paginate') jq -nc --arg old "$TEST_OLD_HEAD" '[[{id:5381512887,user:{login:"alice"},
     state:"CHANGES_REQUESTED",commit_id:$old,submitted_at:"2026-10-01T15:25:05Z",
     body:"## 🔴 Changes Requested"}]]' ;;
-  'api repos/example/widgets/pulls/5938') jq -nc --arg head "$TEST_HEAD" \
+  # After a "moved" review, GitHub reports the author's newer push.
+  'api repos/example/widgets/pulls/5938') jq -nc \
+    --arg head "$(cat "$TEST_MOVED_FILE" 2>/dev/null || printf '%s' "$TEST_HEAD")" \
     '{head:{sha:$head},additions:10,deletions:2}' ;;
   *) echo "Unexpected gh call: $*" >&2; exit 1 ;;
 esac
@@ -66,7 +68,10 @@ cat > "$TMP/bin/pi" <<'PI'
 #!/usr/bin/env bash
 echo run >> "$TEST_PI_LOG"
 echo '## ⚪ Review Incomplete (not approved)'
-if [[ "$TEST_PI_MODE" == held ]]; then
+if [[ "$TEST_PI_MODE" == moved ]]; then
+  # The author pushed mid-review; the helper refused the stale head.
+  printf '%s\n' 1111111111111111111111111111111111111111 > "$TEST_MOVED_FILE"
+elif [[ "$TEST_PI_MODE" == held ]]; then
   # The helper with PRSMASH_HOLD_INCOMPLETE=true: nothing posted, body kept.
   [[ "$PRSMASH_HOLD_INCOMPLETE" == true ]] || { echo "hold not requested" >&2; exit 1; }
   printf '## ⚪ Review Incomplete (not approved)\n\nCI is still running the SDK tests.\n' \
@@ -92,6 +97,7 @@ chmod +x "$TMP/queue.sh" "$TMP/bin/gh" "$TMP/bin/pi" "$TMP/bin/curl"
 run_prsmash() {
   env PATH="$TMP/bin:$PATH" HOME="$TMP" TEST_BASE="$BASE" TEST_HEAD="$HEAD" TEST_OLD_HEAD="$OLD_HEAD" \
     TEST_PI_MODE="$1" TEST_PI_LOG="$TMP/pi.log" TEST_CURL_LOG="$TMP/curl.log" \
+    TEST_MOVED_FILE="$TMP/moved-head" \
     PRSMASH_QUEUE_SCRIPT="$TMP/queue.sh" PRSMASH_SOURCE_REPO="$TMP/source" \
     PRSMASH_LOG_DIR="$TMP/logs" PRSMASH_SLACK_APPROVAL_NOTIFY=false PRSMASH_MERGEABLE_POLL_SECS=0 \
     PRSMASH_NTFY_NOTIFY=true PRSMASH_NTFY_SERVER=https://ntfy.invalid PRSMASH_NTFY_TOPIC=test \
@@ -194,5 +200,22 @@ rg -q 'Review tools missing from PATH: no-such-review-tool' "$TMP/output" || fai
   || fail "missing tool not pushed"
 TEST_TOOLS="gh no-such-review-tool" run_prsmash held
 [[ $(rg -c 'Title: Review tools missing' "$TMP/curl.log") == 1 ]] || fail "missing tool pushed again"
+
+# 9. The author pushes mid-review and nothing is posted: superseded, no push,
+#    and the old head is recorded (lleverage#7824's false "not posted" alert).
+new_head moved
+notifications=$(wc -l < "$TMP/curl.log")
+run_prsmash moved
+rm -f "$TMP/moved-head"
+[[ $(status) == "OK|SUPERSEDED" ]] || fail "expected OK|SUPERSEDED, got $(status)"
+[[ $(disposition "$HEAD") == superseded ]] || fail "superseded head was not recorded"
+[[ $(wc -l < "$TMP/curl.log") == "$notifications" ]] || fail "a superseded review sent a notification"
+rg -q '^superseded=1$' "$TMP/logs/latest/summary.txt" || fail "summary did not count the superseded review"
+
+# 10. An unmoved head that publishes nothing is still NOT_POSTED and alerts.
+new_head silent-again
+run_prsmash silent
+[[ $(status) == "OK|NOT_POSTED" ]] || fail "unmoved silent review not NOT_POSTED: $(status)"
+rg -q 'Title: Review not posted for #5938' <(tail -n 3 "$TMP/curl.log") || fail "NOT_POSTED stopped alerting"
 
 echo "incomplete review loop tests passed"

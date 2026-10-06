@@ -912,6 +912,7 @@ manual_approval=0
 changes_requested=0
 incomplete=0
 held=0
+superseded=0
 not_posted=0
 conflicting=0
 errored=0
@@ -1198,7 +1199,7 @@ review_pr_bg() {
   local last_activity_at=${8:-}
   local pr_author=${9:-}
   local start end duration attempt=1 latest_state lock_name disposition_source
-  local result_file analyzed_head reviews_json started_at outcome
+  local result_file analyzed_head reviews_json started_at outcome current_head
   local pr_meta changed_lines timeout_file timeout_count review_timeout review_rc
   local decision activity_count=0 merge_state preamble="" held_attempts=0
 
@@ -1302,6 +1303,11 @@ review_pr_bg() {
       outcome=$(review_run_outcome "$result_file" "$pr_repo" "$pr_number" "$analyzed_head" \
         "$reviews_json" "$user" "$started_at")
       IFS=$'\t' read -r latest_state disposition_source <<<"$outcome"
+      if [[ "$latest_state" == NOT_POSTED ]]; then
+        current_head=$(gh api "repos/${pr_repo}/pulls/${pr_number}" 2>/dev/null | jq -r '.head.sha // empty' 2>/dev/null || true)
+        latest_state=$(superseded_state "$latest_state" "$analyzed_head" "$current_head")
+        [[ "$latest_state" == SUPERSEDED ]] && disposition_source=superseded
+      fi
       echo "prsmashOutcome=${latest_state} head=${analyzed_head} disposition=${disposition_source:-none}" >> "$log_file"
       if [[ "$latest_state" == INCOMPLETE_HELD ]]; then
         # The author can push between the locked head refresh and the
@@ -1450,6 +1456,9 @@ while [[ $completed -lt $total ]]; do
       notify_pr_ntfy "$(ntfy_kind_for_state "$latest_state")" "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$time_str" \
         "$(cat "${status_file}.reason" 2>/dev/null || true)" || true
       held=$((held + 1)) ;;
+    OK:SUPERSEDED)
+      echo -e "${prefix} ${BLUE}Superseded${RESET} ${suffix} ${DIM}— the PR moved on during the review; nothing posted, the new head is reviewed next tick${RESET}"
+      superseded=$((superseded + 1)) ;;
     OK:NOT_POSTED)
       echo -e "${prefix} ${YELLOW}Not posted${RESET} ${suffix} ${DIM}— reviewer published nothing; head recorded as handled, see ${log_file}${RESET}"
       notify_pr_ntfy "$(ntfy_kind_for_state "$latest_state")" "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$time_str" || true
@@ -1482,6 +1491,7 @@ awaiting_manual_approval=$manual_approval
 changes_requested=$changes_requested
 incomplete=$incomplete
 held=$held
+superseded=$superseded
 not_posted=$not_posted
 conflicting=$conflicting
 EOF
@@ -1505,6 +1515,9 @@ if [[ "$held" -gt 0 ]]; then
 fi
 if [[ "$conflicting" -gt 0 ]]; then
   echo -e "  ${YELLOW}${conflicting} conflicting${RESET} ${DIM}— not reviewed; conflict notice posted, re-review once resolved${RESET}"
+fi
+if [[ "$superseded" -gt 0 ]]; then
+  echo -e "  ${BLUE}${superseded} superseded${RESET} ${DIM}— the PR moved on mid-review; the new head is reviewed next tick${RESET}"
 fi
 if [[ "$not_posted" -gt 0 ]]; then
   echo -e "  ${YELLOW}${not_posted} not posted${RESET} ${DIM}— reviewer published nothing; check the logs${RESET}"
