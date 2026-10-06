@@ -124,4 +124,19 @@ IFS=$'\t' read -r title priority tags <<<"$(ntfy_message_spec conflicting 7250)"
 ntfy_message_body conflicting "Title" alice 0m0s | grep -q 're-review once resolved' \
   || fail "conflicting body does not promise the re-review"
 
+# Held INCOMPLETE: nothing posted, retried quietly; giving up is a high push.
+write_result held "" INCOMPLETE
+expect INCOMPLETE_HELD incomplete-held "$stale_reviews"
+[[ -z $(ntfy_kind_for_state INCOMPLETE_HELD) ]] || fail "a held review must not notify"
+[[ $(ntfy_kind_for_state INCOMPLETE_GAVE_UP) == held-gave-up ]] || fail "INCOMPLETE_GAVE_UP kind"
+IFS=$'\t' read -r title priority tags <<<"$(ntfy_message_spec held-gave-up 7250)"
+[[ "$title" == "Review stuck on #7250" && "$priority" == high ]] || fail "held-gave-up ntfy spec"
+ntfy_message_body held-gave-up "Title" alice 9m0s "CI still running." \
+  | grep -q 'nothing was posted on the PR. CI still running.' || fail "held-gave-up body lacks the reason"
+
+printf '## ⚪ Review Incomplete (not approved)\n\n> banner\n\nCould not run the SDK tests.\n\n### To move this forward\n' > "$TMP/held.md"
+[[ $(held_review_reason "$TMP/held.md") == "Could not run the SDK tests." ]] \
+  || fail "held reason is not the first prose line: $(held_review_reason "$TMP/held.md")"
+[[ -z $(held_review_reason "$TMP/missing.md") ]] || fail "missing held body produced a reason"
+
 echo "review-outcome tests passed"

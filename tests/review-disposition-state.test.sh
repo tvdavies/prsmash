@@ -121,4 +121,33 @@ jq -n --arg head "$new_head" '{repo:"lleverage-ai/lleverage",pr:5938,head:$head,
 [[ $(review_disposition_decision "$repo" "$pr" "$new_head" "2026-10-02T08:40:00Z") == activity ]] \
   || fail "legacy record did not use reviewedAt"
 
+# Held INCOMPLETE: retried when someone answers, CI finishes or the backoff
+# passes, up to PRSMASH_MAX_HELD_ATTEMPTS rounds in all.
+checks_finished=false
+held_head_checks_finished() { [[ "$checks_finished" == true ]]; }
+now_iso=$(date -Is)
+record_review_disposition "$repo" "$pr" "$reviewed_head" incomplete-held "$now_iso" 0 \
+  '{"heldAttempts":1,"ciFinishedAtHold":false}'
+[[ $(review_disposition_decision "$repo" "$pr" "$reviewed_head" "") == handled ]] \
+  || fail "a fresh hold with CI running was retried at once"
+checks_finished=true
+[[ $(review_disposition_decision "$repo" "$pr" "$reviewed_head" "") == held-retry ]] \
+  || fail "CI finishing after the hold did not retry"
+record_review_disposition "$repo" "$pr" "$reviewed_head" incomplete-held "$now_iso" 0 \
+  '{"heldAttempts":1,"ciFinishedAtHold":true}'
+[[ $(review_disposition_decision "$repo" "$pr" "$reviewed_head" "") == handled ]] \
+  || fail "CI that had already finished at hold time retried again"
+[[ $(review_disposition_decision "$repo" "$pr" "$reviewed_head" "$(date -u -d '+1 minute' +%Y-%m-%dT%H:%M:%SZ)") == held-retry ]] \
+  || fail "a comment after the held review did not retry"
+[[ $(PRSMASH_HELD_RETRY_MINS=0 review_disposition_decision "$repo" "$pr" "$reviewed_head" "") == held-retry ]] \
+  || fail "the backoff did not retry"
+record_review_disposition "$repo" "$pr" "$reviewed_head" incomplete-held "$now_iso" 0 \
+  '{"heldAttempts":3,"ciFinishedAtHold":false}'
+[[ $(PRSMASH_HELD_RETRY_MINS=0 review_disposition_decision "$repo" "$pr" "$reviewed_head" "$(date -u -d '+1 minute' +%Y-%m-%dT%H:%M:%SZ)") == handled ]] \
+  || fail "held retries were not capped at three"
+[[ $(PRSMASH_MAX_HELD_ATTEMPTS=4 review_disposition_decision "$repo" "$pr" "$reviewed_head" "") == held-retry ]] \
+  || fail "the held cap is not configurable"
+[[ $(review_disposition_field "$repo" "$pr" "$reviewed_head" heldAttempts) == 3 ]] \
+  || fail "extra fields were not merged into the record"
+
 echo "review-disposition-state tests passed"
