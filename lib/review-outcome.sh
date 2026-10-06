@@ -19,6 +19,10 @@
 #                             the operator is told privately
 #                             (both written by prsmash from INCOMPLETE_HELD)
 #   NOT_POSTED                the reviewer finished but published nothing
+#   SUPERSEDED                nothing was posted because the PR moved to a
+#                             new head during the review; the new head is
+#                             reviewed on the next tick (written by prsmash
+#                             via superseded_state, not by this function)
 #   CONFLICTING               not reviewed: the branch conflicts with its base
 #                             and a conflict notice was posted instead
 #                             (written by prsmash itself, not by this function)
@@ -95,6 +99,7 @@ ntfy_kind_for_state() {
     INCOMPLETE_HELD) ;; # retried quietly; only giving up is worth a push
     INCOMPLETE_GAVE_UP) echo held-gave-up ;;
     NOT_POSTED) echo not-posted ;;
+    SUPERSEDED) ;; # routine: the new head is reviewed next tick
     CONFLICTING) echo conflicting ;;
     *) echo commented ;;
   esac
@@ -141,4 +146,21 @@ held_review_reason() {
     /^[[:space:]]*$/ || /^#/ || /^<!--/ || /^>/ || /^---/ { next }
     { print; exit }
   ' "$file" | cut -c1-240
+}
+
+# superseded_state STATE ANALYZED_HEAD CURRENT_HEAD -> the state to report.
+#
+# A review that published nothing because the author pushed mid-review is not
+# a stuck head: the posting helper refuses a stale head by design, and the new
+# head has no disposition, so the next tick reviews it. lleverage#7824 raised a
+# high-priority "will not be retried" alert for exactly this. Any other state,
+# or an unknown current head, is returned unchanged.
+superseded_state() {
+  local state=$1 analyzed_head=$2 current_head=$3
+  if [[ "$state" == NOT_POSTED && -n "$current_head" && -n "$analyzed_head" \
+        && "$current_head" != "$analyzed_head" ]]; then
+    echo SUPERSEDED
+  else
+    echo "$state"
+  fi
 }

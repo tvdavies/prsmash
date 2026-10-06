@@ -186,7 +186,9 @@ notifications — subscribe to the topic in the ntfy app:
 | Review failed | **urgent** (max) | 🚨 |
 
 Each notification describes what this run did, never an earlier review
-still showing on GitHub. Each notification links to the PR (tap to open).
+still showing on GitHub. A review that publishes nothing because the
+author pushed during it is recorded as superseded and sends nothing: the new
+head is reviewed on the next tick, so it is not a stuck review. Each notification links to the PR (tap to open).
 Skips (`LOCKED`, `HANDLED`) are silent — nothing was done to the PR. A run that dies
 before reviewing (invalid queue response) also publishes an urgent
 failure.

@@ -139,4 +139,11 @@ printf '## ⚪ Review Incomplete (not approved)\n\n> banner\n\nCould not run the
   || fail "held reason is not the first prose line: $(held_review_reason "$TMP/held.md")"
 [[ -z $(held_review_reason "$TMP/missing.md") ]] || fail "missing held body produced a reason"
 
+# Nothing posted because the PR moved mid-review: superseded, and silent.
+[[ $(superseded_state NOT_POSTED "$head" "$old_head") == SUPERSEDED ]] || fail "moved head not superseded"
+[[ $(superseded_state NOT_POSTED "$head" "$head") == NOT_POSTED ]] || fail "unmoved head called superseded"
+[[ $(superseded_state NOT_POSTED "$head" "") == NOT_POSTED ]] || fail "unknown current head called superseded"
+[[ $(superseded_state APPROVED "$head" "$old_head") == APPROVED ]] || fail "a posted review called superseded"
+[[ -z $(ntfy_kind_for_state SUPERSEDED) ]] || fail "a superseded review must not notify"
+
 echo "review-outcome tests passed"
