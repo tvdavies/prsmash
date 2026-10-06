@@ -28,6 +28,8 @@ source "$PRSMASH_LIB_DIR/review-timeout.sh"
 source "$PRSMASH_LIB_DIR/review-outcome.sh"
 # shellcheck source=../lib/merge-conflicts.sh
 source "$PRSMASH_LIB_DIR/merge-conflicts.sh"
+# shellcheck source=../lib/review-env.sh
+source "$PRSMASH_LIB_DIR/review-env.sh"
 PRSMASH_SOURCE_REPO="${PRSMASH_SOURCE_REPO:-$HOME/dev/lleverage-ai/lleverage}"
 SLACK_SCRIPT="${PRSMASH_SLACK_SCRIPT:-$HOME/.claude/skills/slack/scripts/slack.sh}"
 SLACK_APPROVAL_NOTIFY="${PRSMASH_SLACK_APPROVAL_NOTIFY:-true}"
@@ -49,6 +51,11 @@ APPROVAL_ACTOR="${PRSMASH_SLACK_APPROVAL_USER:-}"
 # Small reviews start at 45 minutes. Large PRs get two hours immediately;
 # a smaller PR that times out gets a longer budget on its next attempt.
 REVIEW_TIMEOUT="${PRSMASH_REVIEW_TIMEOUT:-2700}"
+# An INCOMPLETE review is held, not posted: the head is retried when its CI
+# finishes, someone comments, or PRSMASH_HELD_RETRY_MINS pass, and after
+# PRSMASH_MAX_HELD_ATTEMPTS held rounds you get a private ntfy instead of the
+# PR getting a "Review Incomplete" comment. false restores posting.
+HOLD_INCOMPLETE=$(printf '%s' "${PRSMASH_HOLD_INCOMPLETE:-true}" | tr '[:upper:]' '[:lower:]')
 MAX_REVIEW_TIMEOUT="${PRSMASH_MAX_REVIEW_TIMEOUT:-7200}"
 LARGE_PR_LINES="${PRSMASH_LARGE_PR_LINES:-1001}"
 validate_review_timeout_config "$REVIEW_TIMEOUT" "$MAX_REVIEW_TIMEOUT" "$LARGE_PR_LINES"
@@ -155,10 +162,15 @@ ln -sfn "$RUN_DIR" "$LOG_ROOT/latest"
 # here). Prune run dirs older than the retention window, politely (idle IO
 # class) and in the background so it never delays a review tick.
 RUN_RETENTION_DAYS="${PRSMASH_RUN_RETENTION_DAYS:-7}"
+# One turbo cache for every review worktree: the first review of a head builds
+# the workspace packages its tests depend on (about a minute in lleverage), and
+# later reviews reuse them instead of rebuilding.
+REVIEW_TURBO_CACHE_DIR="${TURBO_CACHE_DIR:-$LOG_ROOT/turbo-cache}"
 if [[ "$RUN_RETENTION_DAYS" =~ ^[0-9]+$ && "$RUN_RETENTION_DAYS" -gt 0 ]]; then
   (
     find "$LOG_ROOT/runs" -mindepth 1 -maxdepth 1 -type d -mtime "+${RUN_RETENTION_DAYS}" -print0 2>/dev/null \
       | ionice -c3 xargs -0 -r rm -rf 2>/dev/null
+    find "$REVIEW_TURBO_CACHE_DIR" -type f -mtime "+${RUN_RETENTION_DAYS}" -delete 2>/dev/null
   ) &
   disown $! 2>/dev/null || true
 fi
@@ -387,7 +399,7 @@ ntfy_publish() {
 # (urgent) and are deduplicated per PR within NTFY_FAILURE_COOLDOWN_MINS so a
 # systemic outage does not hammer the phone every tick.
 notify_pr_ntfy() {
-  local kind=$1 pr_number=$2 pr_repo=$3 pr_title=$4 pr_author=$5 time_str=$6
+  local kind=$1 pr_number=$2 pr_repo=$3 pr_title=$4 pr_author=$5 time_str=$6 detail=${7:-}
   local title priority tags body pr_url marker_file safe_key spec
 
   [[ "$NTFY_NOTIFY" == "true" ]] || return 0
@@ -407,7 +419,7 @@ notify_pr_ntfy() {
   fi
 
   pr_url="https://github.com/${pr_repo}/pull/${pr_number}"
-  body=$(ntfy_message_body "$kind" "$pr_title" "$pr_author" "$time_str")
+  body=$(ntfy_message_body "$kind" "$pr_title" "$pr_author" "$time_str" "$detail")
 
   if ntfy_publish "$title" "$priority" "$tags" "$body" "$pr_url"; then
     [[ -n "${marker_file:-}" ]] && date -Is > "$marker_file"
@@ -737,6 +749,25 @@ process_pending_approvals() {
   exec {lock_fd}>&-
 }
 
+# --- Review tools ---
+# A tool missing from PATH silently costs whole reviews (lleverage#7664 could
+# not read its ticket without linear-cli), so say so loudly, once a day per set.
+check_review_tools() {
+  local missing marker
+  missing=$(missing_review_tools | sort -u | tr '\n' ' ' | sed 's/ $//')
+  [[ -n "$missing" ]] || return 0
+  echo -e "${YELLOW}Review tools missing from PATH: ${missing}${RESET} ${DIM}(PATH=${PATH})${RESET}" >&2
+  [[ "$DRY_RUN" != true ]] || return 0
+  mkdir -p "$LOG_ROOT/ntfy-notifications"
+  marker="$LOG_ROOT/ntfy-notifications/tools-missing-$(tr -c 'A-Za-z0-9._-' '_' <<<"$missing")"
+  [[ -n "$(find "$marker" -mmin -1440 2>/dev/null)" ]] && return 0
+  # Claim the day before publishing, so overlapping runs push once.
+  date -Is > "$marker"
+  ntfy_publish "Review tools missing: ${missing}" high wrench \
+    "prsmash reviews run without ${missing} on PATH, so reviews that need them cannot finish. Fix the service PATH (systemd drop-in)." "" || true
+}
+check_review_tools
+
 # --- Pending approvals ---
 # Ahead of the queue fetch, because every path out of the queue section can exit
 # early — an empty queue is the common case, and a reaction left since the last
@@ -880,6 +911,7 @@ approved=0
 manual_approval=0
 changes_requested=0
 incomplete=0
+held=0
 not_posted=0
 conflicting=0
 errored=0
@@ -992,14 +1024,21 @@ run_pr_review() {
   local analyzed_head
   analyzed_head=$(git -C "$worktree_dir" rev-parse HEAD)
 
+  # Dependencies first, so the reviewer can run the changed tests rather than
+  # call them unverifiable. Never fatal; the line tells the reviewer's log why.
+  install_review_dependencies "$worktree_dir" "$tmp_dir"
+
   # Incremental re-review: when we know the commit our last review looked at,
   # narrow the review to what changed since. Only valid if that commit is an
   # ancestor of the current head (a rebase/force-push invalidates it).
   local skill_cmd="/skill:pr-review --headless --post --independent-checks --pr ${pr_number}"
-  if [[ -n "$since_commit" && "$since_commit" != "null" ]]; then
+  if [[ "$since_commit" == "$analyzed_head" ]]; then
+    # Someone answered on a head we already reviewed: no new code, so there is
+    # no delta to narrow to. The reviewer reads the new discussion in full.
+    echo "incrementalReviewSince=same-head (no new commits; full review of the new discussion)"
+  elif [[ -n "$since_commit" && "$since_commit" != "null" ]]; then
     if git -C "$worktree_dir" cat-file -e "$since_commit" 2>/dev/null \
-       && git -C "$worktree_dir" merge-base --is-ancestor "$since_commit" HEAD 2>/dev/null \
-       && [[ "$since_commit" != "$(git -C "$worktree_dir" rev-parse HEAD)" ]]; then
+       && git -C "$worktree_dir" merge-base --is-ancestor "$since_commit" HEAD 2>/dev/null; then
       skill_cmd="/skill:pr-review --headless --post --independent-checks --pr ${pr_number} --since ${since_commit}"
       echo "incrementalReviewSince=${since_commit}"
     else
@@ -1023,7 +1062,7 @@ run_pr_review() {
   fi
 
   local rc=0
-  (cd "$worktree_dir" && TMPDIR="$tmp_dir" PR_REVIEW_TMPDIR="$tmp_dir" PRSMASH_REVIEW_RESULT_FILE="$result_file" PRSMASH_REVIEW_EXPECTED_HEAD="$analyzed_head" PRSMASH_APPROVAL_LINE_LIMIT="$APPROVAL_LINE_LIMIT" PRSMASH_TRUSTED_AUTHORS="$TRUSTED_AUTHORS" PRSMASH_AUTO_APPROVE_ALL="$AUTO_APPROVE_ALL" "${runner[@]}") || rc=$?
+  (cd "$worktree_dir" && TMPDIR="$tmp_dir" PR_REVIEW_TMPDIR="$tmp_dir" PRSMASH_REVIEW_RESULT_FILE="$result_file" PRSMASH_REVIEW_EXPECTED_HEAD="$analyzed_head" PRSMASH_HOLD_INCOMPLETE="$HOLD_INCOMPLETE" TURBO_CACHE_DIR="$REVIEW_TURBO_CACHE_DIR" TURBO_TELEMETRY_DISABLED=1 PRSMASH_APPROVAL_LINE_LIMIT="$APPROVAL_LINE_LIMIT" PRSMASH_TRUSTED_AUTHORS="$TRUSTED_AUTHORS" PRSMASH_AUTO_APPROVE_ALL="$AUTO_APPROVE_ALL" "${runner[@]}") || rc=$?
   if [[ $rc -eq 124 || $rc -eq 137 ]]; then
     echo "PRSMASH_REVIEW_TIMEOUT: killed after ${review_timeout}s"
   fi
@@ -1112,6 +1151,42 @@ handle_merge_conflict() {
   return 1
 }
 
+# record_held_review REPO PR HEAD STARTED_AT ACTIVITY_COUNT ATTEMPT RESULT_FILE STATUS_FILE LOG_FILE
+#
+# The reviewer could not finish and held its INCOMPLETE review instead of
+# posting it. Keep the body (run directories are cleaned up), note whether CI
+# had finished so a later finish can trigger the retry, and give up after the
+# last allowed attempt: the status then says so and the reason goes to ntfy.
+record_held_review() {
+  local pr_repo=$1 pr_number=$2 head_oid=$3 started_at=$4 activity_count=$5 attempt=$6
+  local result_file=$7 status_file=$8 log_file=$9
+  local held_dir kept_body="" source_body ci_finished=false max state extra
+  max=${PRSMASH_MAX_HELD_ATTEMPTS:-3}
+  [[ "$max" =~ ^[0-9]+$ ]] || max=3
+
+  source_body=$(jq -r '.heldBody // empty' "$result_file" 2>/dev/null || true)
+  if [[ -n "$source_body" && -f "$source_body" ]]; then
+    held_dir="$LOG_ROOT/held-reviews"
+    mkdir -p "$held_dir"
+    kept_body="$held_dir/$(printf '%s-%s-%s' "$pr_repo" "$pr_number" "$head_oid" | tr '/:' '__').md"
+    cp "$source_body" "$kept_body" || kept_body=""
+  fi
+  held_head_checks_finished "$pr_repo" "$pr_number" && ci_finished=true
+
+  extra=$(jq -nc --argjson attempts "$attempt" --argjson ci "$ci_finished" --arg body "$kept_body" \
+    '{heldAttempts: $attempts, ciFinishedAtHold: $ci} + (if $body == "" then {} else {heldBody: $body} end)')
+  if ! record_review_disposition "$pr_repo" "$pr_number" "$head_oid" incomplete-held \
+        "$started_at" "$activity_count" "$extra"; then
+    echo "Could not persist the held review for ${pr_repo}#${pr_number} at ${head_oid}; this head may be reviewed again." >&2
+  fi
+
+  state=INCOMPLETE_HELD
+  [[ "$attempt" -ge "$max" ]] && state=INCOMPLETE_GAVE_UP
+  echo "heldAttempt=${attempt}/${max} ciFinishedAtHold=${ci_finished} heldBody=${kept_body:-none}" >> "$log_file"
+  held_review_reason "$kept_body" > "${status_file}.reason"
+  printf 'OK|%s|%d\n' "$state" "$(( $(date +%s) - $(date -d "$started_at" +%s) ))" > "$status_file"
+}
+
 review_pr_bg() {
   local pr_number=$1
   local pr_repo=$2
@@ -1125,7 +1200,7 @@ review_pr_bg() {
   local start end duration attempt=1 latest_state lock_name disposition_source
   local result_file analyzed_head reviews_json started_at outcome
   local pr_meta changed_lines timeout_file timeout_count review_timeout review_rc
-  local decision activity_count=0 merge_state preamble=""
+  local decision activity_count=0 merge_state preamble="" held_attempts=0
 
   lock_name=$(printf '%s-%s' "$pr_repo" "$pr_number" | tr '/:' '__')
   exec {pr_lock_fd}>"$LOG_ROOT/locks/pr-${lock_name}.lock"
@@ -1156,6 +1231,14 @@ review_pr_bg() {
       [[ "$activity_count" =~ ^[0-9]+$ ]] || activity_count=0
       activity_count=$((activity_count + 1))
       preamble+="activityRereview=${activity_count} lastActivityAt=${last_activity_at}"$'\n' ;;
+    held-retry)
+      # Our last look at this head could not finish and was held, not posted.
+      # CI finished, someone answered or the backoff passed: try again.
+      held_attempts=$(review_disposition_field "$pr_repo" "$pr_number" "$head_oid" heldAttempts || echo 1)
+      [[ "$held_attempts" =~ ^[0-9]+$ ]] || held_attempts=1
+      activity_count=$(review_disposition_field "$pr_repo" "$pr_number" "$head_oid" activityRereviews || echo 0)
+      [[ "$activity_count" =~ ^[0-9]+$ ]] || activity_count=0
+      preamble+="heldRetry=$((held_attempts + 1)) of ${PRSMASH_MAX_HELD_ATTEMPTS:-3}"$'\n' ;;
   esac
   : > "$log_file"
 
@@ -1220,6 +1303,14 @@ review_pr_bg() {
         "$reviews_json" "$user" "$started_at")
       IFS=$'\t' read -r latest_state disposition_source <<<"$outcome"
       echo "prsmashOutcome=${latest_state} head=${analyzed_head} disposition=${disposition_source:-none}" >> "$log_file"
+      if [[ "$latest_state" == INCOMPLETE_HELD ]]; then
+        # The author can push between the locked head refresh and the
+        # worktree fetch; a new head starts its held count from zero.
+        [[ "$analyzed_head" == "$head_oid" ]] || held_attempts=0
+        record_held_review "$pr_repo" "$pr_number" "$analyzed_head" "$started_at" \
+          "$activity_count" "$((held_attempts + 1))" "$result_file" "$status_file" "$log_file"
+        return 0
+      fi
       # Record every outcome against this head, including approvals and
       # blocking reviews: an overlapping run whose queue was fetched before
       # this review posted must not review the same head again (lleverage#7250
@@ -1351,6 +1442,14 @@ while [[ $completed -lt $total ]]; do
       notify_pr_ntfy "$(ntfy_kind_for_state "$latest_state")" "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$time_str" || true
       incomplete=$((incomplete + 1))
       reviewed=$((reviewed + 1)) ;;
+    OK:INCOMPLETE_HELD)
+      echo -e "${prefix} ${YELLOW}Held${RESET} ${suffix} ${DIM}— review could not finish; nothing posted, retrying when CI finishes or someone answers${RESET}"
+      held=$((held + 1)) ;;
+    OK:INCOMPLETE_GAVE_UP)
+      echo -e "${prefix} ${RED}Stuck${RESET} ${suffix} ${DIM}— held on every attempt; nothing posted, see ${log_file}${RESET}"
+      notify_pr_ntfy "$(ntfy_kind_for_state "$latest_state")" "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$time_str" \
+        "$(cat "${status_file}.reason" 2>/dev/null || true)" || true
+      held=$((held + 1)) ;;
     OK:NOT_POSTED)
       echo -e "${prefix} ${YELLOW}Not posted${RESET} ${suffix} ${DIM}— reviewer published nothing; head recorded as handled, see ${log_file}${RESET}"
       notify_pr_ntfy "$(ntfy_kind_for_state "$latest_state")" "$pr_number" "$pr_repo" "$pr_title" "$pr_author" "$time_str" || true
@@ -1382,6 +1481,7 @@ approved=$approved
 awaiting_manual_approval=$manual_approval
 changes_requested=$changes_requested
 incomplete=$incomplete
+held=$held
 not_posted=$not_posted
 conflicting=$conflicting
 EOF
@@ -1399,6 +1499,9 @@ if [[ "$manual_approval" -gt 0 ]]; then
 fi
 if [[ "$incomplete" -gt 0 ]]; then
   echo -e "  ${YELLOW}${incomplete} incomplete${RESET} ${DIM}— commented with the missing coverage; not approved${RESET}"
+fi
+if [[ "$held" -gt 0 ]]; then
+  echo -e "  ${YELLOW}${held} held${RESET} ${DIM}— review could not finish; nothing posted, retried later${RESET}"
 fi
 if [[ "$conflicting" -gt 0 ]]; then
   echo -e "  ${YELLOW}${conflicting} conflicting${RESET} ${DIM}— not reviewed; conflict notice posted, re-review once resolved${RESET}"

@@ -12,6 +12,12 @@
 #   COMMENTED                 a non-blocking comment or review was posted
 #   MANUAL_APPROVAL_REQUIRED  approval held back for a human (comment posted)
 #   INCOMPLETE                a COMMENTED "review incomplete" review was posted
+#                             (only with PRSMASH_HOLD_INCOMPLETE=false)
+#   INCOMPLETE_HELD           the review could not finish; nothing was posted
+#                             and the head will be retried
+#   INCOMPLETE_GAVE_UP        held on every allowed attempt; nothing posted,
+#                             the operator is told privately
+#                             (both written by prsmash from INCOMPLETE_HELD)
 #   NOT_POSTED                the reviewer finished but published nothing
 #   CONFLICTING               not reviewed: the branch conflicts with its base
 #                             and a conflict notice was posted instead
@@ -39,6 +45,8 @@ review_run_outcome() {
 
     if [[ "$manual" == "true" ]]; then
       printf 'MANUAL_APPROVAL_REQUIRED\tmanual-approval-required\n'
+    elif [[ "$posting" == "held" ]]; then
+      printf 'INCOMPLETE_HELD\tincomplete-held\n'
     elif [[ "$verdict" == "INCOMPLETE" ]]; then
       printf 'INCOMPLETE\tincomplete-review\n'
     elif [[ "$posting" == "issue-comment" ]]; then
@@ -84,6 +92,8 @@ ntfy_kind_for_state() {
     COMMENTED) echo commented ;;
     MANUAL_APPROVAL_REQUIRED) echo awaiting-approval ;;
     INCOMPLETE) echo incomplete ;;
+    INCOMPLETE_HELD) ;; # retried quietly; only giving up is worth a push
+    INCOMPLETE_GAVE_UP) echo held-gave-up ;;
     NOT_POSTED) echo not-posted ;;
     CONFLICTING) echo conflicting ;;
     *) echo commented ;;
@@ -100,6 +110,7 @@ ntfy_message_spec() {
     commented) printf 'Commented on #%s\tdefault\tspeech_balloon\n' "$pr_number" ;;
     awaiting-approval) printf 'Needs your approval: #%s\thigh\teyes\n' "$pr_number" ;;
     incomplete) printf 'Review incomplete on #%s\tdefault\thourglass\n' "$pr_number" ;;
+    held-gave-up) printf 'Review stuck on #%s\thigh\tpause_button\n' "$pr_number" ;;
     not-posted) printf 'Review not posted for #%s\thigh\tgrey_question\n' "$pr_number" ;;
     conflicting) printf 'Merge conflicts on #%s\tdefault\tconstruction\n' "$pr_number" ;;
     failed) printf 'Review FAILED for #%s\turgent\trotating_light\n' "$pr_number" ;;
@@ -107,14 +118,27 @@ ntfy_message_spec() {
   esac
 }
 
-# ntfy_message_body KIND TITLE AUTHOR TIME -> the push body for one PR.
+# ntfy_message_body KIND TITLE AUTHOR TIME [DETAIL] -> the push body for one PR.
 ntfy_message_body() {
-  local kind=$1 pr_title=$2 pr_author=$3 time_str=$4
+  local kind=$1 pr_title=$2 pr_author=$3 time_str=$4 detail=${5:-}
   case "$kind" in
+    held-gave-up) printf '%s (%s) — review could not finish after every retry; nothing was posted on the PR. %s' "$pr_title" "$pr_author" "$detail" ;;
     failed) printf '%s (%s) — review errored after %s' "$pr_title" "$pr_author" "$time_str" ;;
     incomplete) printf '%s (%s) — commented, not approved: required coverage still missing (%s)' "$pr_title" "$pr_author" "$time_str" ;;
     not-posted) printf '%s (%s) — review finished but published nothing; this head will not be retried (%s)' "$pr_title" "$pr_author" "$time_str" ;;
     conflicting) printf '%s (%s) — conflicts with its base; posted the files, will re-review once resolved' "$pr_title" "$pr_author" ;;
     *) printf '%s (%s) — %s' "$pr_title" "$pr_author" "$time_str" ;;
   esac
+}
+
+# held_review_reason BODY_FILE -> one line saying why a held review could not
+# finish: the body's first prose line (after the verdict heading), cut to 240
+# characters. Nothing when the file is missing.
+held_review_reason() {
+  local file=$1
+  [[ -n "$file" && -f "$file" ]] || return 0
+  awk '
+    /^[[:space:]]*$/ || /^#/ || /^<!--/ || /^>/ || /^---/ { next }
+    { print; exit }
+  ' "$file" | cut -c1-240
 }

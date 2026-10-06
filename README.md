@@ -45,7 +45,17 @@ For each selected PR, `prsmash`:
    SHA, the worktree must be clean, and `git diff --name-only` must
    match `gh pr diff --name-only` exactly. A mismatch fails the review
    rather than reviewing the wrong code.
-3. Runs `pi` inside the worktree with the `pr-review` skill:
+3. **Installs the worktree's dependencies** so the reviewer can run the
+   changed tests: the lockfile picks the command (pnpm, bun, npm or yarn),
+   always with `--ignore-scripts` (and `--ignore-pnpmfile` for pnpm) and without
+   the service's secrets, since lifecycle scripts and hooks are PR-controlled
+   code and lleverage's reach outside the worktree. `PRSMASH_INSTALL_CMD`
+   replaces the command (the systemd unit adds lleverage's Prisma generate),
+   `PRSMASH_INSTALL_DEPS=false` turns it off, and `PRSMASH_INSTALL_TIMEOUT`
+   (default 900s) bounds it. A failed install is logged, not fatal. Review
+   worktrees share one turbo cache (`~/.prsmash/turbo-cache`), so workspace
+   packages a test needs are built once, not once per review.
+4. Runs `pi` inside the worktree with the `pr-review` skill:
 
    ```bash
    pi --model "$MODEL" --session-dir <run>/sessions/pr-<N> \
@@ -53,7 +63,7 @@ For each selected PR, `prsmash`:
       -p "/skill:pr-review --headless --post --independent-checks --pr <N>"
    ```
 
-4. Records the run's own outcome from the posting helper's result file
+5. Records the run's own outcome from the posting helper's result file
    (never from an older GitHub review), appends our latest GitHub review
    to the log for context, and cleans up worktrees and temp refs when the
    run finishes (also on Ctrl-C, including the whole child process tree).
@@ -80,10 +90,29 @@ recorded head is reviewed again when:
   extra looks per head, so a reply loop cannot recreate the old review loop.
 
 A review that ends `INCOMPLETE` (the review itself could not finish, nothing
-critical found) is posted as a COMMENTED review on the reviewed head; it never
-approves, requests changes or dismisses an earlier blocking review. Every
-posting short of an approval must carry a "To move this forward" section that
-names who acts next; the posting helper refuses it otherwise.
+critical found) is **held, not posted** (`PRSMASH_HOLD_INCOMPLETE=true`, the
+default). Nothing appears on the PR; the body is kept in `held-reviews/` and the
+head is retried, up to `PRSMASH_MAX_HELD_ATTEMPTS` (default 3) rounds in all,
+when the first of these happens:
+
+- CI on the head finishes, if it was still running when the review was held
+  (green CI is the reviewer's evidence for tests it could not run itself);
+- a person other than us comments on the PR;
+- `PRSMASH_HELD_RETRY_MINS` (default 45) pass.
+
+If the last attempt is still incomplete, prsmash sends you one high-priority
+ntfy with the reason and leaves the head alone until a new commit arrives.
+`PRSMASH_HOLD_INCOMPLETE=false` restores posting a COMMENTED "Review
+Incomplete" review, which never approves, requests changes or dismisses an
+earlier blocking review. Every posting short of an approval must carry a "To
+move this forward" section that names who acts next; the posting helper refuses
+it otherwise.
+
+Each run starts by checking that the tools the reviewer needs are on PATH
+(`PRSMASH_REQUIRED_TOOLS`, default `gh git jq pi linear-cli pnpm`). A missing
+tool is printed and pushed to ntfy at most once a day, because the reviewer
+otherwise just works around it: lleverage#7664 lost its ticket check to a
+`linear-cli` missing from the service PATH.
 
 Reviews are guarded by locks: interactive runs take a global lock, while
 scheduled runs overlap and take one lock per PR. A PR already being reviewed
@@ -98,7 +127,8 @@ reviewers' blocking requests retain their existing queue behaviour.
 PRs changing 1,001 or more lines get up to two hours for their first attempt.
 Smaller reviews start at 45 minutes; after a timeout on the same head, the next
 attempt gets 90 minutes, then two hours. Successful reviews and new heads reset
-the small-PR budget. Scheduled runs allow 2h10m for review and cleanup.
+the small-PR budget. Scheduled runs allow 2h27m: up to 15 minutes installing
+dependencies, two hours reviewing, and cleanup.
 
 ## Human approval policy
 
@@ -149,7 +179,9 @@ notifications — subscribe to the topic in the ntfy app:
 | Commented | default | 💬 |
 | Changes requested | high | ⚠️ |
 | Awaiting your approval | high | 👀 |
-| Review incomplete (commented, not approved) | default | ⌛ |
+| Review incomplete (commented, not approved; only with hold off) | default | ⌛ |
+| Review stuck (held on every attempt, nothing posted) | high | ⏸️ |
+| Review tools missing from PATH (at most daily) | high | 🔧 |
 | Review not posted (head will not be retried) | high | ❔ |
 | Review failed | **urgent** (max) | 🚨 |
 

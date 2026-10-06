@@ -17,7 +17,15 @@ TimeoutStartSec=60
 # spend stay bounded.
 Environment=PRSMASH_MAX_CONCURRENT_RUNS=4
 Environment=PRSMASH_LOG_DIR=/home/tvd/.prsmash
-Environment=PATH=/home/tvd/.pi/agent/bin:/home/tvd/.local/bin:/home/tvd/.local/share/nvm/v24.15.0/bin:/usr/bin:/bin:/opt/google-cloud-cli/bin
+# Every tool the reviewer needs must be on this PATH: it treats anything
+# missing as unavailable (lleverage#7664 lost its ticket check to linear-cli,
+# #7821 its test run to pnpm). prsmash warns at the start of each run when one
+# of PRSMASH_REQUIRED_TOOLS is missing.
+Environment=PATH=/home/tvd/.pi/agent/bin:/home/tvd/.local/bin:/home/tvd/.local/share/pnpm:/home/tvd/.local/share/nvm/v24.16.0/bin:/usr/bin:/bin:/opt/google-cloud-cli/bin
+
+# Review worktrees install dependencies without lifecycle scripts; lleverage's
+# app tests also need the Prisma client generated.
+Environment="PRSMASH_INSTALL_CMD=pnpm install --frozen-lockfile --prefer-offline --ignore-scripts --ignore-pnpmfile && pnpm --filter app exec prisma generate --generator client"
 
 # Keep the anthropic-claude-code provider available for explicit model
 # overrides. These values live in fish's config, which the systemd user manager
@@ -57,8 +65,9 @@ ExecStart=/bin/sh -c ' \
     --setenv=SLACK_MCP_XOXC_TOKEN="$$SLACK_MCP_XOXC_TOKEN" \
     --setenv=SLACK_MCP_XOXD_TOKEN="$$SLACK_MCP_XOXD_TOKEN" \
     --setenv=PRSMASH_NTFY_TOKEN="$$PRSMASH_NTFY_TOKEN" \
+    --setenv=PRSMASH_INSTALL_CMD="$$PRSMASH_INSTALL_CMD" \
     --setenv=PRSMASH_ALLOW_CONCURRENT=1 \
-    --property=RuntimeMaxSec=7800 \
+    --property=RuntimeMaxSec=8820 \
     /home/tvd/.local/bin/prsmash --all'
 
 # Dispatch decisions stay in hourly.log (one line per tick, so no interleaving).

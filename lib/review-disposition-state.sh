@@ -20,16 +20,17 @@ review_disposition_exists() {
   [[ -f "$file" ]]
 }
 
-# record_review_disposition REPO PR HEAD [SOURCE] [STARTED_AT] [ACTIVITY_REREVIEWS]
+# record_review_disposition REPO PR HEAD [SOURCE] [STARTED_AT] [ACTIVITY_REREVIEWS] [EXTRA_JSON]
 #
 # STARTED_AT is when the review that produced this disposition began. Author
 # activity after that moment can earn the same head another look (see
 # review_disposition_decision); activity before it was already in front of the
 # reviewer. ACTIVITY_REREVIEWS counts how many of those extra looks this head
-# has had, so a bot that answers every review cannot loop us.
+# has had, so a bot that answers every review cannot loop us. EXTRA_JSON is an
+# object merged into the record (a held review's attempts, CI state and body).
 record_review_disposition() {
   local repo=$1 pr_number=$2 head_oid=$3 source=${4:-automated-review}
-  local started_at=${5:-} activity_rereviews=${6:-0}
+  local started_at=${5:-} activity_rereviews=${6:-0} extra=${7:-'{}'}
   local file tmp now
   file=$(review_disposition_file "$repo" "$pr_number" "$head_oid") || return 1
   [[ "$activity_rereviews" =~ ^[0-9]+$ ]] || activity_rereviews=0
@@ -45,8 +46,9 @@ record_review_disposition() {
       --arg reviewedAt "$now" \
       --arg startedAt "$started_at" \
       --argjson activityRereviews "$activity_rereviews" \
+      --argjson extra "$extra" \
       '{repo: $repo, pr: $pr, head: $head, source: $source, reviewedAt: $reviewedAt,
-        startedAt: $startedAt, activityRereviews: $activityRereviews}' \
+        startedAt: $startedAt, activityRereviews: $activityRereviews} + $extra' \
       > "$tmp"; then
     mv "$tmp" "$file"
   else
@@ -76,6 +78,8 @@ iso_to_epoch() {
 #             mergeability and reviews only once the branch merges cleanly
 #   activity  handled, but someone other than us commented after that review
 #             started (evidence, a decision, an answer): one more look
+#   held-retry  the review could not finish and was held, not posted; retry
+#             now (see held_review_decision)
 #   handled   handled and nothing new: skip until a new commit arrives
 #
 # Activity re-reviews are capped per head (default 2) so an author-side bot
@@ -99,6 +103,11 @@ review_disposition_decision() {
   activity_epoch=$(iso_to_epoch "$last_activity_at")
   started_epoch=$(iso_to_epoch "$started_at")
 
+  if [[ "$source" == incomplete-held ]]; then
+    held_review_decision "$file" "$repo" "$pr_number" "$activity_epoch" "$started_epoch"
+    return 0
+  fi
+
   if [[ -n "$activity_epoch" && -n "$started_epoch" ]] \
       && [[ "$activity_epoch" -gt "$started_epoch" ]] \
       && [[ "$count" -lt "$max" ]]; then
@@ -106,6 +115,57 @@ review_disposition_decision() {
   else
     echo handled
   fi
+}
+
+# held_head_checks_finished REPO PR -> success when the PR's current checks
+# have all finished (none pending). Overridable in tests.
+held_head_checks_finished() {
+  local repo=$1 pr_number=$2 buckets
+  # gh exits non-zero while checks are pending; the JSON still says which.
+  buckets=$(gh pr checks "$pr_number" --repo "$repo" --json bucket --jq '.[].bucket' 2>/dev/null || true)
+  [[ -n "$buckets" ]] && ! grep -qx pending <<<"$buckets"
+}
+
+# held_review_decision FILE REPO PR ACTIVITY_EPOCH STARTED_EPOCH -> held-retry
+# or handled for a head whose review was held as INCOMPLETE.
+#
+# A held review is retried, up to PRSMASH_MAX_HELD_ATTEMPTS rounds in all
+# (default 3), as soon as something that could let it finish changes:
+#   - someone other than us commented after it started (evidence, an answer);
+#   - CI was still running when it was held and has now finished, so its
+#     results can stand in for the tests the reviewer could not run;
+#   - PRSMASH_HELD_RETRY_MINS (default 45) have passed, for anything else.
+held_review_decision() {
+  local file=$1 repo=$2 pr_number=$3 activity_epoch=$4 started_epoch=$5
+  local attempts max ci_finished held_epoch backoff
+  attempts=$(jq -r '.heldAttempts // 1' "$file" 2>/dev/null || echo 1)
+  [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=1
+  max=${PRSMASH_MAX_HELD_ATTEMPTS:-3}
+  [[ "$max" =~ ^[0-9]+$ ]] || max=3
+  if [[ "$attempts" -ge "$max" ]]; then
+    echo handled
+    return 0
+  fi
+
+  if [[ -n "$activity_epoch" && -n "$started_epoch" && "$activity_epoch" -gt "$started_epoch" ]]; then
+    echo held-retry
+    return 0
+  fi
+
+  ci_finished=$(jq -r '.ciFinishedAtHold // false' "$file" 2>/dev/null || echo false)
+  if [[ "$ci_finished" != true ]] && held_head_checks_finished "$repo" "$pr_number"; then
+    echo held-retry
+    return 0
+  fi
+
+  backoff=${PRSMASH_HELD_RETRY_MINS:-45}
+  [[ "$backoff" =~ ^[0-9]+$ ]] || backoff=45
+  held_epoch=$(iso_to_epoch "$(jq -r '.reviewedAt // empty' "$file" 2>/dev/null || true)")
+  if [[ -n "$held_epoch" ]] && (( $(date +%s) - held_epoch >= backoff * 60 )); then
+    echo held-retry
+    return 0
+  fi
+  echo handled
 }
 
 # Reviews posted as issue comments are invisible to GitHub's review state, so
